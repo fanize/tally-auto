@@ -1,0 +1,48 @@
+﻿name: Auto Build Tally
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone upstream Tally
+        run: git clone --depth 1 https://github.com/cypressincloud/Tally.git upstream
+
+      - name: Get upstream SHA
+        id: up
+        run: cd upstream && echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Apply patch
+        id: patch
+        run: |
+          cd upstream
+          git apply --3way ../patches/tally-auto.patch 2>/dev/null && echo "ok=true" >> $GITHUB_OUTPUT || echo "ok=false" >> $GITHUB_OUTPUT
+
+      - name: Setup JDK 17
+        if: steps.patch.outputs.ok == 'true'
+        uses: actions/setup-java@v4
+        with: {java-version: "17", distribution: "microsoft"}
+
+      - name: Build
+        if: steps.patch.outputs.ok == 'true'
+        run: cd upstream && chmod +x gradlew && ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Publish
+        if: steps.patch.outputs.ok == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "tally-${{ steps.up.outputs.sha }}"
+          files: upstream/app/build/outputs/apk/debug/*.apk
+          body: "Auto build from upstream ${{ steps.up.outputs.sha }}"
+
+      - name: Notify failure
+        if: steps.patch.outputs.ok == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({owner:context.repo.owner,repo:context.repo.repo,title:"Patch failed on upstream ${{ steps.up.outputs.sha }}",body:"Please update patches/tally-auto.patch manually."})
