@@ -1,4 +1,4 @@
-﻿diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
 index 2ebd1c4..aae38d8 100644
 --- a/app/src/main/AndroidManifest.xml
 +++ b/app/src/main/AndroidManifest.xml
