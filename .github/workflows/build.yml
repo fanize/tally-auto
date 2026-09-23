@@ -12,7 +12,7 @@ jobs:
       - id: up
         run: cd upstream && echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
       - id: patch
-        run: cd upstream && (patch -p1 --fuzz=3 < ../patches/tally-auto.patch && echo "ok=true" >> $GITHUB_OUTPUT) || echo "ok=false" >> $GITHUB_OUTPUT
+        run: cd upstream && (git apply ../patches/tally-auto.patch && echo "ok=true" >> $GITHUB_OUTPUT) || (echo "ok=false" >> $GITHUB_OUTPUT && echo "Patch failed")
       - if: steps.patch.outputs.ok == 'true'
         uses: actions/setup-java@v4
         with: {java-version: "17", distribution: "microsoft"}
