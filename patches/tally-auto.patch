@@ -1,0 +1,2332 @@
+﻿diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 2ebd1c4..aae38d8 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -95,6 +95,34 @@
+             android:excludeFromRecents="true"
+             android:launchMode="singleTop"/>
+ 
++        <!-- 外部记账接口（自动化记账用，无界面）：tally://publicapi/addbill?... -->
++        <activity
++            android:name=".api.TallyApiActivity"
++            android:exported="true"
++            android:theme="@style/Theme.BudgetApp.Transparent"
++            android:excludeFromRecents="true"
++            android:noHistory="true"
++            android:launchMode="singleTop">
++            <intent-filter>
++                <action android:name="android.intent.action.VIEW" />
++                <category android:name="android.intent.category.DEFAULT" />
++                <category android:name="android.intent.category.BROWSABLE" />
++                <data
++                    android:scheme="tally"
++                    android:host="publicapi"
++                    android:pathPrefix="/addbill" />
++            </intent-filter>
++        </activity>
++
++        <!-- 只读数据接口（供 AutoAccounting 反向同步账本/账户/分类）：
++             content://com.example.budgetapp.sync/export
++             Provider 内部校验调用方包名必须是 net.ankio.auto -->
++        <provider
++            android:name=".api.TallySyncProvider"
++            android:authorities="com.example.budgetapp.sync"
++            android:exported="true"
++            android:grantUriPermissions="false" />
++
+         <activity
+             android:name=".ui.AboutActivity"
+             android:label="关于"
+diff --git a/app/src/main/java/com/example/budgetapp/MainActivity.java b/app/src/main/java/com/example/budgetapp/MainActivity.java
+index 5eefbc2..31dbde3 100644
+--- a/app/src/main/java/com/example/budgetapp/MainActivity.java
++++ b/app/src/main/java/com/example/budgetapp/MainActivity.java
+@@ -155,7 +155,8 @@ public class MainActivity extends AppCompatActivity {
+ 
+         financeViewModel = new ViewModelProvider(this).get(FinanceViewModel.class);
+         
+-        financeViewModel.getAllTransactions().observe(this, transactions -> {
++        // 【多账本】导出备份必须包含所有账本
++        financeViewModel.getAllTransactionsAllBooks().observe(this, transactions -> {
+             this.allTransactions = transactions;
+         });
+ 
+diff --git a/app/src/main/java/com/example/budgetapp/MyApplication.java b/app/src/main/java/com/example/budgetapp/MyApplication.java
+index 7019706..3dfe86e 100644
+--- a/app/src/main/java/com/example/budgetapp/MyApplication.java
++++ b/app/src/main/java/com/example/budgetapp/MyApplication.java
+@@ -81,5 +81,9 @@ public class MyApplication extends Application {
+             } catch (Exception ignored) {
+             }
+         });
++
++        // 【多账本】启动时校正账本数据（恢复备份后可能存在“账单指向不存在的账本”）
++        com.example.budgetapp.database.AppDatabase.databaseWriteExecutor.execute(() ->
++                com.example.budgetapp.util.BookManager.reconcileBooksSync(this));
+ }
+ }
+\ No newline at end of file
+diff --git a/app/src/main/java/com/example/budgetapp/api/TallyApi.java b/app/src/main/java/com/example/budgetapp/api/TallyApi.java
+new file mode 100644
+index 0000000..7316c58
+--- /dev/null
++++ b/app/src/main/java/com/example/budgetapp/api/TallyApi.java
+@@ -0,0 +1,310 @@
++package com.example.budgetapp.api;
++
++import android.net.Uri;
++
++import java.text.SimpleDateFormat;
++import java.util.Date;
++import java.util.Locale;
++
++/**
++ * Tally 外部记账接口（Automation API）——参数模型与解析。
++ *
++ * <p>协议：{@code tally://publicapi/addbill?...}，供 AutoAccounting 等自动化工具调用。
++ * 设计原则：<b>宽容解析</b>——未知参数忽略，缺失参数用默认值，解析失败给出可读原因。</p>
++ *
++ * <p>示例：</p>
++ * <pre>
++ * tally://publicapi/addbill?type=0&amp;money=26.5&amp;time=2026-09-22 12:30:00
++ *   &amp;remark=午餐&amp;catename=餐饮&amp;subcategory=午饭
++ *   &amp;accountname=微信&amp;currency=CNY&amp;tag=出差&amp;flag=0&amp;id=12345&amp;showresult=0
++ * </pre>
++ *
++ * <p>参数说明：</p>
++ * <ul>
++ *   <li>{@code type} 0支出 1收入 2转账 3负债(借入) 4借出</li>
++ *   <li>{@code money} 金额（正数，必填）</li>
++ *   <li>{@code fee} 手续费(&lt;0) 或 优惠(&gt;0)，可空</li>
++ *   <li>{@code time} {@code yyyy-MM-dd HH:mm:ss} 或 毫秒时间戳，可空（默认当前时间）</li>
++ *   <li>{@code remark} 备注；{@code catename} 分类；{@code subcategory} 二级分类</li>
++ *   <li>{@code accountname} 账户（转出账户）；{@code accountname2} 转入账户</li>
++ *   <li>{@code bookname} 账本名（多账本功能启用后生效，当前版本仅接收）</li>
++ *   <li>{@code currency} 币种代码，如 CNY/USD；{@code tag} 标签（逗号分隔）</li>
++ *   <li>{@code flag} 1=不计入统计 2=不计入预算（可组合）</li>
++ *   <li>{@code id} 调用方的账单唯一 ID（用于去重）</li>
++ *   <li>{@code showresult} 0=不弹提示；其余=弹提示</li>
++ * </ul>
++ */
++public final class TallyApi {
++
++    public static final String SCHEME = "tally";
++    public static final String HOST = "publicapi";
++    public static final String PATH_ADD_BILL = "/addbill";
++
++    /** 账本名占位（多账本功能尚未启用时使用） */
++    public static final String DEFAULT_BOOK_NAME = "默认账本";
++
++    // ===== Tally 内部账单类型 =====
++    public static final int TYPE_EXPENSE = 0;   // 支出
++    public static final int TYPE_INCOME = 1;    // 收入
++    public static final int TYPE_TRANSFER = 2;  // 资产互转
++    public static final int TYPE_LIABILITY = 3; // 负债（借入）
++    public static final int TYPE_LEND = 4;      // 借出
++
++    // ===== 标志位（与 AA 的 BillInfoModel 对齐） =====
++    public static final int FLAG_NOT_COUNT = 1;
++    public static final int FLAG_NOT_BUDGET = 2;
++
++    private TallyApi() {
++    }
++
++    /** 解析后的账单数据。 */
++    public static final class Bill {
++        public int type = TYPE_EXPENSE;
++        public double amount = 0d;
++        public double fee = 0d;
++        public long time = 0L;
++        public String remark = "";
++        public String category = "";
++        public String subCategory = "";
++        public String accountNameFrom = "";
++        public String accountNameTo = "";
++        public String bookName = DEFAULT_BOOK_NAME;
++        public String currencyCode = "CNY";
++        public String tags = "";
++        public int flag = 0;
++        public String extId = "";
++        public String extendData = "";
++        public String app = "";
++        public boolean showResult = true;
++
++        /** 是否为转账（需要两个账户） */
++        public boolean isTransfer() {
++            return type == TYPE_TRANSFER;
++        }
++
++        /** 是否需要“对方对象”（负债/借出） */
++        public boolean needsTargetObject() {
++            return type == TYPE_LIABILITY || type == TYPE_LEND;
++        }
++
++        public boolean isExcludedFromBudget() {
++            return (flag & (FLAG_NOT_COUNT | FLAG_NOT_BUDGET)) != 0;
++        }
++    }
++
++    /** 解析异常：参数非法。 */
++    public static class ParseException extends Exception {
++        public ParseException(String message) {
++            super(message);
++        }
++    }
++
++    /**
++     * 将 URI 解析为账单对象。解析失败抛出 {@link ParseException}（带可读原因）。
++     */
++    public static Bill parse(Uri uri) throws ParseException {
++        if (uri == null) {
++            throw new ParseException("uri 为空");
++        }
++        Bill bill = new Bill();
++
++        String typeStr = uri.getQueryParameter("type");
++        if (typeStr == null || typeStr.trim().isEmpty()) {
++            throw new ParseException("缺少 type");
++        }
++        int type;
++        try {
++            type = Integer.parseInt(typeStr.trim());
++        } catch (NumberFormatException e) {
++            throw new ParseException("type 非法: " + typeStr);
++        }
++        if (type < 0 || type > 4) {
++            throw new ParseException("不支持的 type: " + type);
++        }
++        bill.type = type;
++
++        String moneyStr = uri.getQueryParameter("money");
++        if (moneyStr == null || moneyStr.trim().isEmpty()) {
++            throw new ParseException("缺少 money");
++        }
++        double money;
++        try {
++            money = Double.parseDouble(moneyStr.trim());
++        } catch (NumberFormatException e) {
++            throw new ParseException("money 非法: " + moneyStr);
++        }
++        if (money <= 0) {
++            throw new ParseException("money 必须大于 0");
++        }
++        bill.amount = money;
++
++        bill.fee = optDouble(uri, "fee", 0d);
++        bill.time = optTime(uri.getQueryParameter("time"));
++
++        bill.remark = optString(uri, "remark");
++        bill.category = optString(uri, "catename");
++        if (bill.category.isEmpty()) {
++            // 兼容其它调用方写法
++            bill.category = optString(uri, "category");
++        }
++        bill.subCategory = optString(uri, "subcategory");
++        if (bill.subCategory.isEmpty()) {
++            bill.subCategory = optString(uri, "subcatename");
++        }
++        bill.accountNameFrom = optString(uri, "accountname");
++        bill.accountNameTo = optString(uri, "accountname2");
++
++        String book = optString(uri, "bookname");
++        if (!book.isEmpty()) {
++            bill.bookName = book;
++        }
++
++        String currency = optString(uri, "currency");
++        if (!currency.isEmpty()) {
++            bill.currencyCode = normalizeCurrencyCode(currency);
++        }
++
++        bill.tags = optString(uri, "tag");
++        if (bill.tags.isEmpty()) {
++            bill.tags = optString(uri, "tags");
++        }
++        bill.flag = (int) optDouble(uri, "flag", 0d);
++        bill.extId = optString(uri, "id");
++        bill.extendData = optString(uri, "extenddata");
++        bill.app = optString(uri, "app");
++
++        String showResult = optString(uri, "showresult");
++        bill.showResult = showResult.isEmpty() || !"0".equals(showResult);
++
++        // 转账 / 负债 / 借出 必须有第二个账户名
++        if (bill.isTransfer() && bill.accountNameTo.isEmpty()) {
++            throw new ParseException("转账缺少 accountname2");
++        }
++        if (bill.needsTargetObject()
++                && bill.accountNameTo.isEmpty()
++                && bill.accountNameFrom.isEmpty()) {
++            throw new ParseException("负债/借出缺少 accountname2（对方对象）");
++        }
++        return bill;
++    }
++
++    /** 币种代码 → 显示符号。Tally 目前只存符号，未知币种回退 ¥。 */
++    public static String currencySymbolOf(String code) {
++        String c = normalizeCurrencyCode(code);
++        switch (c) {
++            case "CNY":
++            case "RMB":
++                return "¥";
++            case "USD":
++                return "$";
++            case "EUR":
++                return "€";
++            case "GBP":
++                return "£";
++            case "JPY":
++                return "JP¥";
++            case "KRW":
++                return "₩";
++            case "HKD":
++                return "HK$";
++            case "TWD":
++                return "NT$";
++            case "SGD":
++                return "S$";
++            case "AUD":
++                return "A$";
++            case "CAD":
++                return "C$";
++            case "RUB":
++                return "₽";
++            case "THB":
++                return "฿";
++            case "INR":
++                return "₹";
++            default:
++                return "¥";
++        }
++    }
++
++    /** 归一化币种代码：兼容 AA 传入的 JSON（{"code":"USD",...}）或纯代码。 */
++    public static String normalizeCurrencyCode(String raw) {
++        if (raw == null) {
++            return "CNY";
++        }
++        String value = raw.trim();
++        if (value.isEmpty()) {
++            return "CNY";
++        }
++        if (value.startsWith("{")) {
++            // 简易提取 "code":"XXX"，避免引入 JSON 依赖
++            int idx = value.indexOf("\"code\"");
++            if (idx >= 0) {
++                int colon = value.indexOf(':', idx);
++                int firstQuote = value.indexOf('"', colon + 1);
++                int secondQuote = firstQuote >= 0 ? value.indexOf('"', firstQuote + 1) : -1;
++                if (firstQuote >= 0 && secondQuote > firstQuote) {
++                    value = value.substring(firstQuote + 1, secondQuote);
++                }
++            }
++        }
++        return value.trim().toUpperCase(Locale.ROOT);
++    }
++
++    /** 拆分分类：AA 用 "-" 连接父/子分类；若调用方直接给了 subcategory 则优先用它。 */
++    public static String[] splitCategory(String category, String subCategory) {
++        String parent = category == null ? "" : category.trim();
++        String child = subCategory == null ? "" : subCategory.trim();
++        int dash = parent.indexOf('-');
++        if (dash > 0 && child.isEmpty()) {
++            child = parent.substring(dash + 1).trim();
++            parent = parent.substring(0, dash).trim();
++        }
++        return new String[]{parent, child};
++    }
++
++    private static String optString(Uri uri, String key) {
++        String v = uri.getQueryParameter(key);
++        return v == null ? "" : v.trim();
++    }
++
++    private static double optDouble(Uri uri, String key, double def) {
++        String v = uri.getQueryParameter(key);
++        if (v == null || v.trim().isEmpty()) {
++            return def;
++        }
++        try {
++            return Double.parseDouble(v.trim());
++        } catch (NumberFormatException e) {
++            return def;
++        }
++    }
++
++    /** 时间参数：支持 "yyyy-MM-dd HH:mm:ss" 与毫秒时间戳；非法或缺失返回 0。 */
++    private static long optTime(String raw) {
++        if (raw == null || raw.trim().isEmpty()) {
++            return 0L;
++        }
++        String v = raw.trim();
++        if (v.matches("\\d{10,}")) {
++            try {
++                long ts = Long.parseLong(v);
++                // 10 位按秒处理
++                return v.length() <= 10 ? ts * 1000L : ts;
++            } catch (NumberFormatException ignored) {
++                // fallthrough
++            }
++        }
++        String[] patterns = {"yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd", "yyyy/MM/dd HH:mm:ss"};
++        for (String p : patterns) {
++            try {
++                Date d = new SimpleDateFormat(p, Locale.CHINA).parse(v);
++                if (d != null) {
++                    return d.getTime();
++                }
++            } catch (Exception ignored) {
++                // 尝试下一个格式
++            }
++        }
++        return 0L;
++    }
++}
+diff --git a/app/src/main/java/com/example/budgetapp/api/TallyApiActivity.java b/app/src/main/java/com/example/budgetapp/api/TallyApiActivity.java
+new file mode 100644
+index 0000000..c990d9d
+--- /dev/null
++++ b/app/src/main/java/com/example/budgetapp/api/TallyApiActivity.java
+@@ -0,0 +1,82 @@
++package com.example.budgetapp.api;
++
++import android.app.Activity;
++import android.net.Uri;
++import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
++import android.widget.Toast;
++
++/**
++ * 外部记账接口入口（无界面）。
++ *
++ * <p>由自动化工具（如 AutoAccounting）通过 {@code tally://publicapi/addbill?...} 调起，
++ * 写入完成后自动结束；{@code showresult=0} 时完全静默。</p>
++ *
++ * <p>此 Activity 不展示任何界面（透明主题、不进最近任务），只负责解析参数并交给
++ * {@link TallyApiWriter} 写库。写入在后台线程执行，本 Activity 会等待回调再结束，
++ * 以确保进程不会在写库完成前被回收。</p>
++ */
++public class TallyApiActivity extends Activity {
++
++    /** 最长等待写入结果的时间，避免异常情况下界面残留 */
++    private static final long WRITE_TIMEOUT_MS = 10_000L;
++
++    private final Handler handler = new Handler(Looper.getMainLooper());
++    private boolean finished = false;
++
++    @Override
++    protected void onCreate(Bundle savedInstanceState) {
++        super.onCreate(savedInstanceState);
++
++        Uri data = getIntent() != null ? getIntent().getData() : null;
++        if (data == null) {
++            finish();
++            return;
++        }
++
++        final TallyApi.Bill bill;
++        try {
++            bill = TallyApi.parse(data);
++        } catch (TallyApi.ParseException e) {
++            toast("Tally 记账参数错误：" + e.getMessage());
++            finish();
++            return;
++        } catch (Exception e) {
++            toast("Tally 记账失败：" + e.getMessage());
++            finish();
++            return;
++        }
++
++        // 安全网：即使写库回调异常丢失，也不会留下透明界面
++        handler.postDelayed(this::finishOnce, WRITE_TIMEOUT_MS);
++
++        TallyApiWriter.write(this, bill, (ok, duplicated, message) -> {
++            if (bill.showResult) {
++                toast(message);
++            }
++            finishOnce();
++        });
++    }
++
++    @Override
++    protected void onDestroy() {
++        handler.removeCallbacksAndMessages(null);
++        super.onDestroy();
++    }
++
++    private void finishOnce() {
++        if (!finished) {
++            finished = true;
++            finish();
++        }
++    }
++
++    private void toast(String message) {
++        try {
++            Toast.makeText(getApplicationContext(), message, Toast.LENGTH_SHORT).show();
++        } catch (Exception ignored) {
++            // 后台弹 Toast 在部分 ROM 上会失败，忽略
++        }
++    }
++}
+diff --git a/app/src/main/java/com/example/budgetapp/api/TallyApiWriter.java b/app/src/main/java/com/example/budgetapp/api/TallyApiWriter.java
+new file mode 100644
+index 0000000..8341a55
+--- /dev/null
++++ b/app/src/main/java/com/example/budgetapp/api/TallyApiWriter.java
+@@ -0,0 +1,396 @@
++package com.example.budgetapp.api;
++
++import android.app.Application;
++import android.app.NotificationChannel;
++import android.app.NotificationManager;
++import android.content.Context;
++import android.content.SharedPreferences;
++import android.os.Build;
++import android.os.Handler;
++import android.os.Looper;
++import android.text.TextUtils;
++
++import androidx.core.app.NotificationCompat;
++
++import com.example.budgetapp.BackupManager;
++import com.example.budgetapp.R;
++import com.example.budgetapp.database.AppDatabase;
++import com.example.budgetapp.database.AssetAccount;
++import com.example.budgetapp.database.Transaction;
++import com.example.budgetapp.util.CategoryManager;
++import com.example.budgetapp.viewmodel.FinanceViewModel;
++
++import java.text.SimpleDateFormat;
++import java.util.ArrayList;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
++
++/**
++ * 外部记账接口的“写库器”。
++ *
++ * <p>复用 App 自身的写入通道，保证与手动记账行为一致：</p>
++ * <ul>
++ *   <li>支出/收入/负债/借出 → {@link FinanceViewModel#addTransactionWithAssetSync(Transaction)}</li>
++ *   <li>转账（资产互转）→ 与 {@code FinanceViewModel.transferAsset} 相同的双边余额规则</li>
++ * </ul>
++ *
++ * <p>幂等：优先用调用方传入的账单 ID 去重；没有 ID 时按“同类型同金额、时间相近”兜底去重。</p>
++ */
++public final class TallyApiWriter {
++
++    /** 写入结果回调（主线程）。 */
++    public interface Callback {
++        void onResult(boolean ok, boolean duplicated, String message);
++    }
++
++    private static final String PREFS = "tally_api_prefs";
++    private static final String KEY_IDS = "written_ext_ids";
++    private static final int MAX_IDS = 500;
++
++    /** 兜底去重的时间窗口（毫秒） */
++    private static final long FALLBACK_WINDOW_MS = 120_000L;
++
++    /** 通知渠道 ID */
++    private static final String CHANNEL_ID = "tally_auto_record";
++    /** 通知 ID 自增器（避免覆盖前一条） */
++    private static final AtomicInteger NOTIFICATION_ID = new AtomicInteger(1000);
++
++    private TallyApiWriter() {
++    }
++
++    public static void write(final Context context, final TallyApi.Bill bill, final Callback callback) {
++        final Context app = context.getApplicationContext();
++        AppDatabase.databaseWriteExecutor.execute(() -> {
++            boolean ok = false;
++            boolean duplicated = false;
++            String message;
++            try {
++                duplicated = doWrite(app, bill);
++                ok = true;
++                message = duplicated ? "重复账单，已忽略" : "已记账";
++            } catch (Exception e) {
++                ok = false;
++                message = "写入失败：" + e.getMessage();
++            }
++            final boolean fOk = ok;
++            final boolean fDup = duplicated;
++            final String fMsg = message;
++            // 结果通过系统通知告知用户（不再弹界面/Toast）
++            if (fOk && !fDup) {
++                String typeLabel = bill.type == 1 ? "收入" : bill.type == 2 ? "转账" : "支出";
++                String title = "✅ " + typeLabel + " " + trimNumber(bill.amount);
++                String text = TextUtils.isEmpty(bill.remark) ? bill.category : bill.remark;
++                postNotification(app, title, text);
++            } else if (!fOk) {
++                postNotification(app, "❌ Tally 记账失败", fMsg);
++            }
++            if (callback != null) {
++                new Handler(Looper.getMainLooper()).post(() -> callback.onResult(fOk, fDup, fMsg));
++            }
++        });
++    }
++
++    /** 发送系统通知（记账成功/失败） */
++    public static void postNotification(Context context, String title, String text) {
++        try {
++            NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
++            if (nm == null) return;
++            // Android 8+ 需要通知渠道
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++                NotificationChannel channel = new NotificationChannel(CHANNEL_ID,
++                        "自动记账", NotificationManager.IMPORTANCE_DEFAULT);
++                channel.setDescription("外部自动记账结果通知");
++                nm.createNotificationChannel(channel);
++            }
++            NotificationCompat.Builder builder = new NotificationCompat.Builder(context, CHANNEL_ID)
++                    .setSmallIcon(R.drawable.ic_app_logo)
++                    .setContentTitle(title)
++                    .setContentText(text)
++                    .setAutoCancel(true)
++                    .setPriority(NotificationCompat.PRIORITY_DEFAULT);
++            nm.notify(NOTIFICATION_ID.incrementAndGet(), builder.build());
++        } catch (Exception ignored) {
++            // 通知失败不影响记账
++        }
++    }
++
++    /**
++     * 执行写入。返回 true 表示判定为重复账单（未写入）。
++     */
++    private static boolean doWrite(Context app, TallyApi.Bill bill) throws Exception {
++        AppDatabase db = AppDatabase.getDatabase(app);
++
++        if (isDuplicated(app, db, bill)) {
++            return true;
++        }
++
++        // ===== 1. 金额与备注加工（手续费/优惠、标签留痕） =====
++        double amount = bill.amount;
++        StringBuilder remark = new StringBuilder(bill.remark == null ? "" : bill.remark.trim());
++        if (bill.fee < 0) {
++            // AA 约定：fee < 0 为手续费，总额 = money + |fee|
++            double feeValue = -bill.fee;
++            amount = bill.amount + feeValue;
++        } else if (bill.fee > 0) {
++            // fee > 0 为优惠：实扣金额 = money - 优惠
++            amount = bill.amount - bill.fee;
++            if (amount <= 0) {
++                amount = bill.amount;
++            }
++        }
++        if (!TextUtils.isEmpty(bill.tags)) {
++            // 标签存独立字段（二期），不再拼进备注
++        }
++
++        // ===== 2. 分类 =====
++        String[] cate = TallyApi.splitCategory(bill.category, bill.subCategory);
++        String category = cate[0];
++        String subCategory = cate[1];
++        if (bill.type == TallyApi.TYPE_LIABILITY) {
++            category = "负债";
++            subCategory = "";
++        } else if (bill.type == TallyApi.TYPE_LEND) {
++            category = "借出";
++            subCategory = "";
++        } else if (bill.type != TallyApi.TYPE_TRANSFER) {
++            if (category.isEmpty()) {
++                category = "其他";
++            }
++            ensureCategoryExists(app, bill.type, category);
++        }
++
++        long date = bill.time > 0 ? bill.time : System.currentTimeMillis();
++        String note = new SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(new java.util.Date(date));
++
++        // ===== 2.5 账本（多账本：AA 指定账本名则写入对应账本，否则归入当前账本）=====
++        int bookId = 0; // 0 = 交给数据库触发器归入“当前账本”
++        if (!TextUtils.isEmpty(bill.bookName)
++                && !com.example.budgetapp.database.Book.DEFAULT_BOOK_NAME.equals(bill.bookName.trim())) {
++            bookId = com.example.budgetapp.util.BookManager.ensureBookIdSync(app, bill.bookName);
++        }
++
++        // ===== 3. 账户 =====
++        int fromAssetId = resolveAssetId(db, bill.accountNameFrom);
++        if (bill.type == TallyApi.TYPE_TRANSFER) {
++            int toAssetId = resolveAssetId(db, bill.accountNameTo);
++            if (fromAssetId == 0 || toAssetId == 0 || fromAssetId == toAssetId) {
++                throw new IllegalArgumentException("转账需要两个不同的有效账户");
++            }
++            writeTransfer(app, db, bill, fromAssetId, toAssetId, amount, date, remark.toString(), bookId);
++            markWritten(app, bill.extId);
++            return false;
++        }
++
++        // ===== 4. 组装账单 =====
++        Transaction t = new Transaction();
++        t.date = date;
++        t.type = bill.type;
++        t.amount = amount;
++        t.category = category;
++        t.subCategory = subCategory;
++        t.assetId = fromAssetId;
++        t.bookId = bookId;
++        t.currencySymbol = TallyApi.currencySymbolOf(bill.currencyCode);
++        t.currencyCode = TallyApi.normalizeCurrencyCode(bill.currencyCode);
++        t.tags = bill.tags == null ? "" : bill.tags.trim();
++        t.fee = bill.fee;
++        t.photoPath = "";
++        t.excludeFromBudget = bill.isExcludedFromBudget();
++        t.remark = remark.toString();
++
++        if (bill.needsTargetObject()) {
++            // 负债(借入)/借出：对方对象写入 targetObject，Tally 会自动维护对应资产账户
++            String target = !TextUtils.isEmpty(bill.accountNameTo) ? bill.accountNameTo : bill.accountNameFrom;
++            t.targetObject = target;
++            t.note = note;
++        } else if (!TextUtils.isEmpty(bill.accountNameTo)) {
++            // 支出还款 / 收入收款：Tally 依据 note 匹配负债/借出账户名
++            t.note = bill.accountNameTo;
++        } else {
++            t.note = note;
++        }
++
++        // ===== 5. 走 App 自身的写入通道（含资产联动、自动上传、小组件刷新） =====
++        FinanceViewModel viewModel = new FinanceViewModel((Application) app);
++        viewModel.addTransactionWithAssetSync(t);
++
++        markWritten(app, bill.extId);
++        return false;
++    }
++
++    /**
++     * 转账：与 FinanceViewModel#transferAsset 的“同币种”分支保持一致的双边余额规则。
++     */
++    private static void writeTransfer(Context app, AppDatabase db, TallyApi.Bill bill,
++                                      int fromAssetId, int toAssetId, double amount, long date,
++                                      String remark, int bookId) {
++        AssetAccount from = db.assetAccountDao().getAssetByIdSync(fromAssetId);
++        AssetAccount to = db.assetAccountDao().getAssetByIdSync(toAssetId);
++        if (from == null || to == null) {
++            throw new IllegalArgumentException("账户不存在");
++        }
++        db.runInTransaction(() -> {
++            // 转出：负债账户增加负债，其余减少余额
++            if (from.type == 1) {
++                from.amount += amount;
++            } else {
++                from.amount -= amount;
++            }
++            // 转入：负债账户抵扣负债，其余增加余额
++            if (to.type == 1) {
++                to.amount -= amount;
++            } else {
++                to.amount += amount;
++            }
++            long now = System.currentTimeMillis();
++            from.updateTime = now;
++            to.updateTime = now;
++            db.assetAccountDao().update(from);
++            db.assetAccountDao().update(to);
++
++            Transaction t = new Transaction();
++            t.date = date;
++            t.type = TallyApi.TYPE_TRANSFER;
++            t.category = "资产互转";
++            t.subCategory = "";
++            t.amount = amount;
++            t.assetId = from.id;
++            t.bookId = bookId;
++            t.currencySymbol = TallyApi.currencySymbolOf(bill.currencyCode);
++            t.currencyCode = TallyApi.normalizeCurrencyCode(bill.currencyCode);
++            t.tags = bill.tags == null ? "" : bill.tags.trim();
++            t.fee = bill.fee;
++            t.photoPath = "";
++            t.excludeFromBudget = bill.isExcludedFromBudget();
++            t.note = from.name + " -> " + to.name;
++            t.remark = remark;
++            db.transactionDao().insert(t);
++        });
++        BackupManager.triggerAutoUploadIfEnabled(app);
++        com.example.budgetapp.widget.WidgetUtils.updateAllWidgets(app);
++    }
++
++    /**
++     * 按名称查找账户；不存在则创建一个“资产(0)”账户，方便自动化记账开箱即用。
++     */
++    private static int resolveAssetId(AppDatabase db, String name) {
++        if (TextUtils.isEmpty(name)) {
++            return 0;
++        }
++        String target = name.trim();
++        List<AssetAccount> all = db.assetAccountDao().getAllAssetsSync();
++        if (all != null) {
++            for (AssetAccount a : all) {
++                if (a != null && target.equals(a.name) && a.type == 0) {
++                    return a.id;
++                }
++            }
++            for (AssetAccount a : all) {
++                if (a != null && target.equals(a.name)) {
++                    return a.id;
++                }
++            }
++        }
++        AssetAccount created = new AssetAccount(target, 0d, 0);
++        created.updateTime = System.currentTimeMillis();
++        db.assetAccountDao().insert(created);
++        List<AssetAccount> after = db.assetAccountDao().getAllAssetsSync();
++        if (after != null) {
++            for (AssetAccount a : after) {
++                if (a != null && target.equals(a.name) && a.type == 0) {
++                    return a.id;
++                }
++            }
++        }
++        return 0;
++    }
++
++    /** 把新分类补进 Tally 的分类列表，避免账单出现“看不见的分类”。 */
++    private static void ensureCategoryExists(Context app, int type, String category) {
++        try {
++            if (type == TallyApi.TYPE_EXPENSE) {
++                List<String> list = new ArrayList<>(CategoryManager.getExpenseCategories(app));
++                if (!list.contains(category)) {
++                    list.add(category);
++                    CategoryManager.saveExpenseCategories(app, list);
++                }
++            } else if (type == TallyApi.TYPE_INCOME) {
++                List<String> list = new ArrayList<>(CategoryManager.getIncomeCategories(app));
++                if (!list.contains(category)) {
++                    list.add(category);
++                    CategoryManager.saveIncomeCategories(app, list);
++                }
++            }
++        } catch (Exception ignored) {
++            // 分类补录失败不影响记账主流程
++        }
++    }
++
++    // ================= 幂等 =================
++
++    private static boolean isDuplicated(Context app, AppDatabase db, TallyApi.Bill bill) {
++        if (!TextUtils.isEmpty(bill.extId) && hasWritten(app, bill.extId)) {
++            return true;
++        }
++        // 兜底：同类型、同金额、同备注、时间相近（多维度匹配，减少误判）
++        long base = bill.time > 0 ? bill.time : System.currentTimeMillis();
++        List<Transaction> recent = db.transactionDao()
++                .getTransactionsByRange(base - FALLBACK_WINDOW_MS, base + FALLBACK_WINDOW_MS);
++        if (recent != null) {
++            String billRemark = bill.remark == null ? "" : bill.remark.trim();
++            for (Transaction t : recent) {
++                if (t != null && t.type == bill.type
++                        && Math.abs(t.amount - bill.amount) < 0.005d
++                        && TextUtils.equals(t.remark == null ? "" : t.remark.trim(), billRemark)) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    }
++
++    private static boolean hasWritten(Context app, String extId) {
++        if (TextUtils.isEmpty(extId)) {
++            return false;
++        }
++        SharedPreferences prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
++        return prefs.getStringSet(KEY_IDS, new LinkedHashSet<>()).contains(extId);
++    }
++
++    private static void markWritten(Context app, String extId) {
++        if (TextUtils.isEmpty(extId)) {
++            return;
++        }
++        SharedPreferences prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
++        Set<String> ids = new LinkedHashSet<>(prefs.getStringSet(KEY_IDS, new LinkedHashSet<>()));
++        ids.add(extId);
++        // 只保留最近的 MAX_IDS 条，避免无限增长
++        if (ids.size() > MAX_IDS) {
++            List<String> list = new ArrayList<>(ids);
++            ids = new LinkedHashSet<>(list.subList(list.size() - MAX_IDS, list.size()));
++        }
++        prefs.edit().putStringSet(KEY_IDS, ids).apply();
++    }
++
++    // ================= 小工具 =================
++
++    private static void appendRemark(StringBuilder sb, String text) {
++        if (text == null || text.isEmpty()) {
++            return;
++        }
++        if (sb.length() > 0) {
++            sb.append(' ');
++        }
++        sb.append(text);
++    }
++
++    private static String trimNumber(double value) {
++        if (value == Math.floor(value)) {
++            return String.valueOf((long) value);
++        }
++        return String.format(Locale.ROOT, "%.2f", value);
++    }
++}
+diff --git a/app/src/main/java/com/example/budgetapp/api/TallySyncProvider.java b/app/src/main/java/com/example/budgetapp/api/TallySyncProvider.java
+new file mode 100644
+index 0000000..718dfee
+--- /dev/null
++++ b/app/src/main/java/com/example/budgetapp/api/TallySyncProvider.java
+@@ -0,0 +1,194 @@
++package com.example.budgetapp.api;
++
++import android.content.ContentProvider;
++import android.content.ContentValues;
++import android.content.Context;
++import android.database.Cursor;
++import android.database.MatrixCursor;
++import android.net.Uri;
++import android.text.TextUtils;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++
++import com.example.budgetapp.database.AppDatabase;
++import com.example.budgetapp.database.AssetAccount;
++import com.example.budgetapp.database.Book;
++import com.example.budgetapp.util.CategoryManager;
++
++import org.json.JSONArray;
++import org.json.JSONObject;
++
++import java.util.List;
++
++/**
++ * 供自动化工具（AutoAccounting）读取 Tally 数据的只读接口。
++ *
++ * <p>用途：把 Tally 里的<b>账本 / 账户 / 分类</b>导出给 AA，让 AA 的“资产映射、分类映射、
++ * 账本选择”开箱即用（对应 AA 适配器的 {@code syncAssets()}）。</p>
++ *
++ * <p>安全：Provider 虽然 exported，但只允许调用方包名为 {@code net.ankio.auto}
++ * （通过 {@link #getCallingPackage()} 校验），其它应用一律拒绝；且只读、不提供写入。</p>
++ *
++ * <p>用法：{@code content://com.example.budgetapp.sync/export}，返回单列 {@code json} 的游标。</p>
++ */
++public class TallySyncProvider extends ContentProvider {
++
++    public static final String AUTHORITY = "com.example.budgetapp.sync";
++    /** 允许读取数据的调用方包名 */
++    public static final String ALLOWED_CALLER = "net.ankio.auto";
++    /** 导出数据版本，AA 侧据此兼容 */
++    public static final int EXPORT_VERSION = 1;
++
++    @Override
++    public boolean onCreate() {
++        return true;
++    }
++
++    @Nullable
++    @Override
++    public Cursor query(@NonNull Uri uri, @Nullable String[] projection, @Nullable String selection,
++                        @Nullable String[] selectionArgs, @Nullable String sortOrder) {
++        // 仅允许 AA 读取；其它应用（含 shell/root）一律拒绝
++        String caller = getCallingPackage();
++        if (!ALLOWED_CALLER.equals(caller)) {
++            android.util.Log.i("TallySync", "rejected caller=" + caller);
++            return null;
++        }
++        Context context = getContext();
++        if (context == null) {
++            return null;
++        }
++        MatrixCursor cursor = new MatrixCursor(new String[]{"json"});
++        try {
++            String json = buildExportJson(context);
++            android.util.Log.i("TallySync", "served caller=" + caller + " bytes=" + json.length());
++            cursor.addRow(new Object[]{json});
++        } catch (Exception e) {
++            android.util.Log.e("TallySync", "export failed: " + e.getMessage());
++            // 返回空游标，AA 侧会记录同步失败
++            return cursor;
++        }
++        return cursor;
++    }
++
++    /** 组装导出 JSON */
++    private String buildExportJson(Context context) throws Exception {
++        AppDatabase db = AppDatabase.getDatabase(context);
++        JSONObject root = new JSONObject();
++        root.put("version", EXPORT_VERSION);
++        root.put("generatedAt", System.currentTimeMillis());
++
++        // 账本
++        JSONArray books = new JSONArray();
++        List<Book> bookList = db.bookDao().getAllSync();
++        if (bookList != null) {
++            for (Book b : bookList) {
++                if (b == null || TextUtils.isEmpty(b.name)) {
++                    continue;
++                }
++                JSONObject o = new JSONObject();
++                o.put("id", b.id);
++                o.put("name", b.name);
++                o.put("isCurrent", b.isCurrent);
++                o.put("sort", b.sortOrder);
++                books.put(o);
++            }
++        }
++        root.put("books", books);
++
++        // 账户（资产）
++        JSONArray assets = new JSONArray();
++        List<AssetAccount> assetList = db.assetAccountDao().getAllAssetsSync();
++        if (assetList != null) {
++            for (AssetAccount a : assetList) {
++                if (a == null || TextUtils.isEmpty(a.name)) {
++                    continue;
++                }
++                JSONObject o = new JSONObject();
++                o.put("id", a.id);
++                o.put("name", a.name);
++                o.put("type", a.type);
++                o.put("amount", a.amount);
++                o.put("currencySymbol", a.currencySymbol == null ? "¥" : a.currencySymbol);
++                o.put("assetCategory", a.assetCategory == null ? "" : a.assetCategory);
++                assets.put(o);
++            }
++        }
++        root.put("assets", assets);
++
++        // 分类（Tally 分类为全局设置，存于 SharedPreferences）
++        JSONObject categories = new JSONObject();
++        JSONArray expense = new JSONArray();
++        for (String c : CategoryManager.getExpenseCategories(context)) {
++            if (!TextUtils.isEmpty(c)) {
++                expense.put(c);
++            }
++        }
++        JSONArray income = new JSONArray();
++        for (String c : CategoryManager.getIncomeCategories(context)) {
++            if (!TextUtils.isEmpty(c)) {
++                income.put(c);
++            }
++        }
++        JSONObject subMap = new JSONObject();
++        for (String parent : CategoryManager.getExpenseCategories(context)) {
++            List<String> subs = CategoryManager.getSubCategories(context, parent);
++            if (subs != null && !subs.isEmpty()) {
++                JSONArray arr = new JSONArray();
++                for (String s : subs) {
++                    if (!TextUtils.isEmpty(s)) {
++                        arr.put(s);
++                    }
++                }
++                if (arr.length() > 0) {
++                    subMap.put(parent, arr);
++                }
++            }
++        }
++        for (String parent : CategoryManager.getIncomeCategories(context)) {
++            List<String> subs = CategoryManager.getSubCategories(context, parent);
++            if (subs != null && !subs.isEmpty()) {
++                JSONArray arr = new JSONArray();
++                for (String s : subs) {
++                    if (!TextUtils.isEmpty(s)) {
++                        arr.put(s);
++                    }
++                }
++                if (arr.length() > 0) {
++                    subMap.put(parent, arr);
++                }
++            }
++        }
++        categories.put("expense", expense);
++        categories.put("income", income);
++        categories.put("subCategories", subMap);
++        root.put("categories", categories);
++
++        return root.toString();
++    }
++
++    @Nullable
++    @Override
++    public String getType(@NonNull Uri uri) {
++        return "vnd.android.cursor.item/vnd.budgetapp.sync";
++    }
++
++    @Nullable
++    @Override
++    public Uri insert(@NonNull Uri uri, @Nullable ContentValues values) {
++        // 只读接口
++        return null;
++    }
++
++    @Override
++    public int delete(@NonNull Uri uri, @Nullable String selection, @Nullable String[] selectionArgs) {
++        return 0;
++    }
++
++    @Override
++    public int update(@NonNull Uri uri, @Nullable ContentValues values, @Nullable String selection,
++                      @Nullable String[] selectionArgs) {
++        return 0;
++    }
++}
+diff --git a/app/src/main/java/com/example/budgetapp/database/AppDatabase.java b/app/src/main/java/com/example/budgetapp/database/AppDatabase.java
+index 2e6c2c4..4fd38f8 100644
+--- a/app/src/main/java/com/example/budgetapp/database/AppDatabase.java
++++ b/app/src/main/java/com/example/budgetapp/database/AppDatabase.java
+@@ -10,7 +10,7 @@ import androidx.annotation.NonNull;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ 
+-@Database(entities = {Transaction.class, AssetAccount.class, Goal.class}, version = 24, exportSchema = false)
++@Database(entities = {Transaction.class, AssetAccount.class, Goal.class, Book.class}, version = 26, exportSchema = false)
+ public abstract class AppDatabase extends RoomDatabase {
+ 
+     public abstract TransactionDao transactionDao();
+@@ -18,6 +18,9 @@ public abstract class AppDatabase extends RoomDatabase {
+ 
+     public abstract GoalDao goalDao();
+ 
++    /** 【新增】多账本 DAO */
++    public abstract BookDao bookDao();
++
+     private static volatile AppDatabase INSTANCE;
+     private static final int NUMBER_OF_THREADS = 4;
+     public static final ExecutorService databaseWriteExecutor = Executors.newFixedThreadPool(NUMBER_OF_THREADS);
+@@ -184,6 +187,58 @@ public abstract class AppDatabase extends RoomDatabase {
+         }
+     };
+ 
++    // ================= 【新增】多账本：24 -> 25 迁移 =================
++    static final Migration MIGRATION_24_25 = new Migration(24, 25) {
++        @Override
++        public void migrate(@NonNull SupportSQLiteDatabase database) {
++            // 1. 账本表
++            database.execSQL("CREATE TABLE IF NOT EXISTS `books` (" +
++                    "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
++                    "`name` TEXT NOT NULL, " +
++                    "`createdAt` INTEGER NOT NULL, " +
++                    "`sortOrder` INTEGER NOT NULL, " +
++                    "`isCurrent` INTEGER NOT NULL DEFAULT 0)");
++            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_books_name` ON `books` (`name`)");
++
++            // 2. 账单增加所属账本，历史数据统一归入默认账本(1)
++            database.execSQL("ALTER TABLE transactions ADD COLUMN bookId INTEGER NOT NULL DEFAULT 0");
++            database.execSQL("UPDATE transactions SET bookId = 1 WHERE bookId = 0");
++            database.execSQL("CREATE INDEX IF NOT EXISTS `index_transactions_bookId` ON `transactions` (`bookId`)");
++
++            // 3. 默认账本 + 触发器（未指定账本的新账单自动归入当前账本）
++            seedDefaultBook(database);
++        }
++    };
++    // ==============================================================
++
++    /**
++     * 初始化默认账本与“自动归入当前账本”的触发器。
++     *
++     * <p>触发器让 Tally 原有的所有插入路径（手动记账、快捷磁贴、无障碍、利息服务等）
++     * 无需修改即可正确归属账本。</p>
++     */
++    static void seedDefaultBook(@NonNull SupportSQLiteDatabase database) {
++        database.execSQL("INSERT OR IGNORE INTO books (id, name, createdAt, sortOrder, isCurrent) " +
++                "VALUES (" + Book.DEFAULT_BOOK_ID + ", '" + Book.DEFAULT_BOOK_NAME + "', "
++                + System.currentTimeMillis() + ", 0, 1)");
++        database.execSQL("CREATE TRIGGER IF NOT EXISTS trg_transactions_default_book " +
++                "AFTER INSERT ON transactions WHEN NEW.bookId = 0 " +
++                "BEGIN UPDATE transactions SET bookId = " +
++                "COALESCE((SELECT id FROM books WHERE isCurrent = 1 LIMIT 1), " + Book.DEFAULT_BOOK_ID + ") " +
++                "WHERE id = NEW.id; END");
++    }
++
++    // ================= 【二期】25 -> 26 迁移：标签/币种代码/手续费 =================
++    static final Migration MIGRATION_25_26 = new Migration(25, 26) {
++        @Override
++        public void migrate(@NonNull SupportSQLiteDatabase database) {
++            database.execSQL("ALTER TABLE transactions ADD COLUMN tags TEXT DEFAULT ''");
++            database.execSQL("ALTER TABLE transactions ADD COLUMN currencyCode TEXT DEFAULT 'CNY'");
++            database.execSQL("ALTER TABLE transactions ADD COLUMN fee REAL NOT NULL DEFAULT 0.0");
++        }
++    };
++    // ================================================================
++
+     public static AppDatabase getDatabase(final Context context) {
+         if (INSTANCE == null) {
+             synchronized (AppDatabase.class) {
+@@ -199,8 +254,16 @@ public abstract class AppDatabase extends RoomDatabase {
+                                     MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
+                                     MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
+                                     MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
+-                                    MIGRATION_23_24
++                                    MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26
+                             )
++                            .addCallback(new RoomDatabase.Callback() {
++                                @Override
++                                public void onCreate(@NonNull SupportSQLiteDatabase db) {
++                                    super.onCreate(db);
++                                    // 全新安装：初始化默认账本与账本归属触发器
++                                    seedDefaultBook(db);
++                                }
++                            })
+                             .fallbackToDestructiveMigration()
+                             .build();
+                 }
+diff --git a/app/src/main/java/com/example/budgetapp/database/Book.java b/app/src/main/java/com/example/budgetapp/database/Book.java
+new file mode 100644
+index 0000000..f8b3630
+--- /dev/null
++++ b/app/src/main/java/com/example/budgetapp/database/Book.java
+@@ -0,0 +1,50 @@
++package com.example.budgetapp.database;
++
++import androidx.annotation.NonNull;
++import androidx.room.ColumnInfo;
++import androidx.room.Entity;
++import androidx.room.Index;
++import androidx.room.PrimaryKey;
++
++/**
++ * 账本（多账本功能）。
++ *
++ * <p>账单通过 {@link Transaction#bookId} 归属到某个账本；同一时刻只有一个账本的
++ * {@link #isCurrent} 为 1，UI 查询统一按“当前账本”过滤。</p>
++ */
++@Entity(tableName = "books",
++        indices = {@Index(value = "name", unique = true)})
++public class Book {
++
++    /** 默认账本 ID（迁移与恢复时的兜底账本） */
++    public static final int DEFAULT_BOOK_ID = 1;
++    /** 默认账本名称（与 AA 侧 BillInfoModel.DEFAULT_BOOK_NAME 保持一致） */
++    public static final String DEFAULT_BOOK_NAME = "默认账本";
++
++    @PrimaryKey(autoGenerate = true)
++    public int id;
++
++    @NonNull
++    public String name = "";
++
++    /** 创建时间（毫秒） */
++    public long createdAt;
++
++    /** 排序序号，越小越靠前 */
++    public int sortOrder;
++
++    /** 是否为当前账本（1 是，0 否） */
++    @ColumnInfo(defaultValue = "0")
++    public boolean isCurrent;
++
++    public Book() {
++    }
++
++    @androidx.room.Ignore
++    public Book(@NonNull String name, int sortOrder) {
++        this.name = name;
++        this.sortOrder = sortOrder;
++        this.createdAt = System.currentTimeMillis();
++        this.isCurrent = false;
++    }
++}
+diff --git a/app/src/main/java/com/example/budgetapp/database/BookDao.java b/app/src/main/java/com/example/budgetapp/database/BookDao.java
+new file mode 100644
+index 0000000..5f011cb
+--- /dev/null
++++ b/app/src/main/java/com/example/budgetapp/database/BookDao.java
+@@ -0,0 +1,71 @@
++package com.example.budgetapp.database;
++
++import androidx.lifecycle.LiveData;
++import androidx.room.Dao;
++import androidx.room.Delete;
++import androidx.room.Insert;
++import androidx.room.Query;
++import androidx.room.Update;
++
++import java.util.List;
++
++/** 账本 DAO（多账本功能）。 */
++@Dao
++public interface BookDao {
++
++    @Insert
++    long insert(Book book);
++
++    @Update
++    void update(Book book);
++
++    @Delete
++    void delete(Book book);
++
++    @Query("SELECT * FROM books ORDER BY sortOrder ASC, id ASC")
++    List<Book> getAllSync();
++
++    @Query("SELECT * FROM books ORDER BY sortOrder ASC, id ASC")
++    LiveData<List<Book>> getAllLive();
++
++    @Query("SELECT * FROM books WHERE isCurrent = 1 LIMIT 1")
++    Book getCurrentSync();
++
++    @Query("SELECT * FROM books WHERE id = :id LIMIT 1")
++    Book getByIdSync(int id);
++
++    @Query("SELECT * FROM books WHERE name = :name LIMIT 1")
++    Book getByNameSync(String name);
++
++    @Query("SELECT COUNT(*) FROM books")
++    int countSync();
++
++    @Query("UPDATE books SET isCurrent = 0")
++    void clearCurrent();
++
++    @Query("UPDATE books SET isCurrent = 1 WHERE id = :id")
++    void markCurrent(int id);
++
++    @Query("DELETE FROM books WHERE id = :id")
++    void deleteById(int id);
++
++    /** 统计某账本下的账单数量（删除账本前判断用） */
++    @Query("SELECT COUNT(*) FROM transactions WHERE bookId = :bookId")
++    int countTransactions(int bookId);
++
++    /** 账单中出现过的所有账本 ID（用于恢复备份后补建缺失账本） */
++    @Query("SELECT DISTINCT bookId FROM transactions")
++    List<Integer> distinctTransactionBookIds();
++
++    /** 把账单从一个账本迁移到另一个账本（删除账本时使用） */
++    @Query("UPDATE transactions SET bookId = :toBookId WHERE bookId = :fromBookId")
++    void reassignTransactions(int fromBookId, int toBookId);
++
++    /**
++     * 触碰一条账单记录，用于让 Room 的失效追踪器通知所有账单观察者刷新。
++     *
++     * <p>切换账本时调用：账单表本身没有写入，但 UI 需要按新的“当前账本”重新查询。</p>
++     */
++    @Query("UPDATE transactions SET bookId = bookId WHERE id = (SELECT MIN(id) FROM transactions)")
++    void touchTransactions();
++}
+diff --git a/app/src/main/java/com/example/budgetapp/database/Transaction.java b/app/src/main/java/com/example/budgetapp/database/Transaction.java
+index c7d713e..83ba41d 100644
+--- a/app/src/main/java/com/example/budgetapp/database/Transaction.java
++++ b/app/src/main/java/com/example/budgetapp/database/Transaction.java
+@@ -10,7 +10,8 @@ import androidx.room.PrimaryKey;
+         indices = {
+                 @Index("date"),
+                 @Index("type"),
+-                @Index("category")
++                @Index("category"),
++                @Index("bookId")
+         })
+ public class Transaction {
+     @PrimaryKey(autoGenerate = true)
+@@ -34,6 +35,27 @@ public class Transaction {
+     @androidx.room.ColumnInfo(defaultValue = "0")
+     public boolean excludeFromBudget;
+ 
++    /**
++     * 【新增】所属账本 ID（多账本功能）。
++     *
++     * <p>0 表示“未指定”，插入时由数据库触发器自动归入当前账本，
++     * 因此原有插入路径无需修改；外部记账接口可显式指定账本。</p>
++     */
++    @androidx.room.ColumnInfo(defaultValue = "0")
++    public int bookId = 0;
++
++    /** 【二期】标签（逗号分隔，如 "餐饮,报销"） */
++    @androidx.room.ColumnInfo(defaultValue = "")
++    public String tags = "";
++
++    /** 【二期】币种代码（如 "CNY"、"USD"），配合 currencySymbol 显示 */
++    @androidx.room.ColumnInfo(defaultValue = "CNY")
++    public String currencyCode = "CNY";
++
++    /** 【二期】手续费/优惠（负数=手续费，正数=优惠/折扣，0=无） */
++    @androidx.room.ColumnInfo(defaultValue = "0.0")
++    public double fee = 0.0;
++
+     public Transaction() {
+     }
+ 
+diff --git a/app/src/main/java/com/example/budgetapp/database/TransactionDao.java b/app/src/main/java/com/example/budgetapp/database/TransactionDao.java
+index 1450e24..74d3106 100644
+--- a/app/src/main/java/com/example/budgetapp/database/TransactionDao.java
++++ b/app/src/main/java/com/example/budgetapp/database/TransactionDao.java
+@@ -9,8 +9,21 @@ import androidx.room.Update;
+ 
+ import java.util.List;
+ 
++/**
++ * 账单 DAO。
++ *
++ * <p>【多账本】除备份/恢复与外部接口去重之外，所有读取都只在<b>当前账本</b>范围内进行：
++ * 通过 {@code bookId = (SELECT id FROM books WHERE isCurrent = 1 LIMIT 1)} 过滤，
++ * 因此各界面（明细/统计/预算/年视图/小组件）无需修改调用方式即可自动按账本隔离。</p>
++ */
+ @Dao
+ public interface TransactionDao {
++
++    /** 【多账本】当前账本过滤条件 */
++    String CUR_BOOK = " bookId = (SELECT id FROM books WHERE isCurrent = 1 LIMIT 1) ";
++    /** 【多账本】带表别名 t 的当前账本过滤条件（明细页 JOIN 查询用） */
++    String CUR_BOOK_T = " t.bookId = (SELECT id FROM books WHERE isCurrent = 1 LIMIT 1) ";
++
+     @Insert
+     void insert(Transaction transaction);
+ 
+@@ -20,9 +33,16 @@ public interface TransactionDao {
+     @Update
+     void update(Transaction transaction);
+ 
+-    @Query("SELECT * FROM transactions ORDER BY date DESC")
++    // ================= 账单读取（当前账本） =================
++
++    @Query("SELECT * FROM transactions WHERE" + CUR_BOOK + "ORDER BY date DESC")
+     LiveData<List<Transaction>> getAllTransactions();
+ 
++    /** 【多账本】所有账本的账单（备份/导出使用，不受当前账本限制） */
++    @Query("SELECT * FROM transactions ORDER BY date DESC")
++    LiveData<List<Transaction>> getAllTransactionsAllBooks();
++
++    /** 所有账本的账单（同步；备份/恢复/导入使用，不受当前账本限制） */
+     @Query("SELECT * FROM transactions")
+     List<Transaction> getAllTransactionsSync();
+ 
+@@ -33,37 +53,44 @@ public interface TransactionDao {
+     void deleteAll();
+ 
+     // 【新增】小组件使用：同步查询指定时间段加班总收入
+-    @Query("SELECT SUM(amount) FROM transactions WHERE date >= :start AND date <= :end AND type = 1 AND category = '加班'")
++    @Query("SELECT SUM(amount) FROM transactions WHERE" + CUR_BOOK
++            + "AND date >= :start AND date <= :end AND type = 1 AND category = '加班'")
+     Double getOvertimeTotalAmountSync(long start, long end);
+ 
+     // 【新增】小组件使用：同步查询指定时间段所有加班记录（用于计算时长）
+-    @Query("SELECT * FROM transactions WHERE date >= :start AND date <= :end AND type = 1 AND category = '加班'")
++    @Query("SELECT * FROM transactions WHERE" + CUR_BOOK
++            + "AND date >= :start AND date <= :end AND type = 1 AND category = '加班'")
+     List<Transaction> getOvertimeTransactionsSync(long start, long end);
+ 
++    /**
++     * 同步按时间段查询（<b>不做账本过滤</b>）。
++     *
++     * <p>供外部记账接口（AA）去重使用：同一笔账单可能被写入任意账本，需要全局判重。</p>
++     */
+     @Query("SELECT * FROM transactions WHERE date >= :start AND date <= :end")
+     List<Transaction> getTransactionsByRange(long start, long end);
+ 
+-    // 【新增】批量修改一级分类名称（历史账单同步）
++    // 【新增】批量修改一级分类名称（历史账单同步）——对所有账本生效
+     @Query("UPDATE transactions SET category = :newCategory WHERE category = :oldCategory")
+     void updateCategoryName(String oldCategory, String newCategory);
+ 
+-    // 【新增】批量修改二级分类名称（历史账单同步）
++    // 【新增】批量修改二级分类名称（历史账单同步）——对所有账本生效
+     @Query("UPDATE transactions SET subCategory = :newSubCategory WHERE category = :parentCategory AND subCategory = :oldSubCategory")
+     void updateSubCategoryName(String parentCategory, String oldSubCategory, String newSubCategory);
+ 
+ 
+-
+-    // ================= 以下为新增的高性能优化查询 =================
++    // ================= 以下为高性能优化查询 =================
+ 
+     // 1. 按需查询：只获取指定时间段内的账单（用于首页日历按月加载）
+-    @Query("SELECT * FROM transactions WHERE date >= :start AND date <= :end ORDER BY date DESC")
++    @Query("SELECT * FROM transactions WHERE" + CUR_BOOK
++            + "AND date >= :start AND date <= :end ORDER BY date DESC")
+     LiveData<List<Transaction>> getTransactionsByRangeLive(long start, long end);
+ 
+     // 2. 高级过滤：用于明细页 (DetailsFragment) 的高级筛选，null 表示该条件不限制
+-    // 使用普通的 LiveData<List<Transaction>> 返回类型，并加上金额筛选条件和资产筛选
+     @Query("SELECT t.* FROM transactions t " +
+             "LEFT JOIN asset_accounts a ON t.assetId = a.id " +
+             "WHERE t.date BETWEEN :startDate AND :endDate " +
++            "AND" + CUR_BOOK_T +
+             "AND (:type IS NULL OR t.type = :type) " +
+             "AND (:minAmount IS NULL OR t.amount >= :minAmount) " +
+             "AND (:maxAmount IS NULL OR t.amount <= :maxAmount) " +
+@@ -73,20 +100,24 @@ public interface TransactionDao {
+     LiveData<List<Transaction>> getFilteredTransactions(long startDate, long endDate, Integer type, Float minAmount, Float maxAmount, String keyword, String assetName);
+ 
+     // 【新增】供桌面小组件使用：同步聚合查询指定时间的收入或支出总和
+-    @Query("SELECT SUM(amount) FROM transactions WHERE date >= :start AND date <= :end AND type = :type AND category != '资产互转'")
++    @Query("SELECT SUM(amount) FROM transactions WHERE" + CUR_BOOK
++            + "AND date >= :start AND date <= :end AND type = :type AND category != '资产互转'")
+     Double getTotalAmountByTypeSync(long start, long end, int type);
+ 
+ 
+     // 3. 聚合查询：直接让数据库计算指定时间段的收入或支出总和 (返回 Double 防止没数据时报错)
+-    @Query("SELECT SUM(amount) FROM transactions WHERE date >= :start AND date <= :end AND type = :type AND category != '资产互转'")
++    @Query("SELECT SUM(amount) FROM transactions WHERE" + CUR_BOOK
++            + "AND date >= :start AND date <= :end AND type = :type AND category != '资产互转'")
+     LiveData<Double> getTotalAmountByTypeLive(long start, long end, int type);
+ 
+     // 4. 聚合查询：直接计算加班总收入
+-    @Query("SELECT SUM(amount) FROM transactions WHERE date >= :start AND date <= :end AND type = 1 AND category = '加班'")
++    @Query("SELECT SUM(amount) FROM transactions WHERE" + CUR_BOOK
++            + "AND date >= :start AND date <= :end AND type = 1 AND category = '加班'")
+     LiveData<Double> getOvertimeTotalAmountLive(long start, long end);
+ 
+     // 【新增】年视图专用的轻量级查询：只取3个字段，直接排除互转和转账，速度提升 10 倍以上
+-    @Query("SELECT date, type, amount FROM transactions WHERE date >= :start AND date <= :end AND type IN (0, 1) AND category != '资产互转'")
++    @Query("SELECT date, type, amount FROM transactions WHERE" + CUR_BOOK
++            + "AND date >= :start AND date <= :end AND type IN (0, 1) AND category != '资产互转'")
+     List<TransactionMinimal> getMinimalTransactionsSync(long start, long end);
+ 
+     /**
+@@ -96,8 +127,9 @@ public interface TransactionDao {
+      */
+     @Query("SELECT DISTINCT CAST(strftime('%m', date / 1000, 'unixepoch', 'localtime') AS INTEGER) " +
+             "FROM transactions " +
+-            "WHERE date >= :start AND date <= :end " +
++            "WHERE" + CUR_BOOK +
++            "AND date >= :start AND date <= :end " +
+             "AND type IN (0, 1) AND category != '资产互转'")
+     List<Integer> getMonthsWithDataSync(long start, long end);
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/app/src/main/java/com/example/budgetapp/ui/BookDialogs.java b/app/src/main/java/com/example/budgetapp/ui/BookDialogs.java
+new file mode 100644
+index 0000000..8e9270d
+--- /dev/null
++++ b/app/src/main/java/com/example/budgetapp/ui/BookDialogs.java
+@@ -0,0 +1,187 @@
++package com.example.budgetapp.ui;
++
++import android.app.AlertDialog;
++import android.content.Context;
++import android.text.InputType;
++import android.view.inputmethod.EditorInfo;
++import android.widget.EditText;
++import android.widget.Toast;
++
++import com.example.budgetapp.database.Book;
++import com.example.budgetapp.util.BookManager;
++
++import java.util.List;
++
++/**
++ * 多账本相关对话框：切换、新建、重命名、删除。
++ *
++ * <p>用法（在账单页点击顶部“当前账本”即可打开）：</p>
++ * <pre>
++ * BookDialogs.showBookPicker(context, () -&gt; { /* 账本变化后的界面刷新 *\/ });
++ * </pre>
++ */
++public final class BookDialogs {
++
++    private BookDialogs() {
++    }
++
++    /** 账本选择器：点击切换，长按重命名/删除 */
++    public static void showBookPicker(Context context, Runnable onChanged) {
++        final Context appContext = context.getApplicationContext();
++        BookManager.loadBooks(context, books -> {
++            if (books == null || books.isEmpty()) {
++                Toast.makeText(appContext, "账本读取失败", Toast.LENGTH_SHORT).show();
++                return;
++            }
++            final int currentId = BookManager.getCurrentBookId(context);
++            final String[] items = new String[books.size() + 1];
++            for (int i = 0; i < books.size(); i++) {
++                Book b = books.get(i);
++                items[i] = (b.id == currentId ? "✓ " : "") + b.name;
++            }
++            items[books.size()] = "＋ 新建账本…";
++
++            AlertDialog dialog = new AlertDialog.Builder(context)
++                    .setTitle("选择账本")
++                    .setItems(items, (d, which) -> {
++                        if (which == books.size()) {
++                            showCreateDialog(context, true, onChanged);
++                        } else {
++                            Book target = books.get(which);
++                            if (target.id == currentId) {
++                                return;
++                            }
++                            BookManager.setCurrent(context, target, (ok, message) -> {
++                                if (message != null) {
++                                    Toast.makeText(appContext, message, Toast.LENGTH_SHORT).show();
++                                }
++                                if (ok && onChanged != null) {
++                                    onChanged.run();
++                                }
++                            });
++                        }
++                    })
++                    .setNegativeButton("取消", null)
++                    .create();
++            dialog.show();
++
++            // 长按：管理该账本
++            if (dialog.getListView() != null) {
++                dialog.getListView().setOnItemLongClickListener((parent, view, position, id) -> {
++                    if (position >= books.size()) {
++                        return false;
++                    }
++                    showManageDialog(context, books.get(position), onChanged);
++                    dialog.dismiss();
++                    return true;
++                });
++            }
++        });
++    }
++
++    /** 单个账本的管理：重命名 / 删除 */
++    public static void showManageDialog(Context context, Book book, Runnable onChanged) {
++        String[] options = {"重命名", "删除"};
++        new AlertDialog.Builder(context)
++                .setTitle(book.name)
++                .setItems(options, (d, which) -> {
++                    if (which == 0) {
++                        showRenameDialog(context, book, onChanged);
++                    } else {
++                        confirmDelete(context, book, onChanged);
++                    }
++                })
++                .setNegativeButton("取消", null)
++                .show();
++    }
++
++    /** 新建账本 */
++    public static void showCreateDialog(Context context, boolean switchTo, Runnable onChanged) {
++        final Context appContext = context.getApplicationContext();
++        EditText input = buildInput(context, "");
++        new AlertDialog.Builder(context)
++                .setTitle("新建账本")
++                .setView(input)
++                .setPositiveButton("创建", (d, w) -> BookManager.create(context, input.getText().toString(),
++                        (ok, message) -> {
++                            if (!ok) {
++                                Toast.makeText(appContext, message == null ? "创建失败" : message, Toast.LENGTH_SHORT).show();
++                            } else if (switchTo) {
++                                // 创建后立即切换
++                                BookManager.loadBooks(context, books -> {
++                                    String name = input.getText().toString().trim();
++                                    for (Book b : books) {
++                                        if (b.name.equals(name)) {
++                                            BookManager.setCurrent(context, b, (ok2, msg2) -> {
++                                                if (msg2 != null) {
++                                                    Toast.makeText(appContext, msg2, Toast.LENGTH_SHORT).show();
++                                                }
++                                                if (ok2 && onChanged != null) {
++                                                    onChanged.run();
++                                                }
++                                            });
++                                            break;
++                                        }
++                                    }
++                                });
++                            } else if (onChanged != null) {
++                                onChanged.run();
++                            }
++                        }))
++                .setNegativeButton("取消", null)
++                .show();
++    }
++
++    /** 重命名账本 */
++    public static void showRenameDialog(Context context, Book book, Runnable onChanged) {
++        final Context appContext = context.getApplicationContext();
++        EditText input = buildInput(context, book.name);
++        new AlertDialog.Builder(context)
++                .setTitle("重命名账本")
++                .setView(input)
++                .setPositiveButton("保存", (d, w) -> BookManager.rename(context, book, input.getText().toString(),
++                        (ok, message) -> {
++                            if (message != null) {
++                                Toast.makeText(appContext, message, Toast.LENGTH_SHORT).show();
++                            }
++                            if (ok && onChanged != null) {
++                                onChanged.run();
++                            }
++                        }))
++                .setNegativeButton("取消", null)
++                .show();
++    }
++
++    /** 删除账本确认 */
++    public static void confirmDelete(Context context, Book book, Runnable onChanged) {
++        final Context appContext = context.getApplicationContext();
++        new AlertDialog.Builder(context)
++                .setTitle("删除账本")
++                .setMessage("确定删除「" + book.name + "」吗？\n该账本下的账单会自动迁移到其它账本，不会丢失。")
++                .setPositiveButton("删除", (d, w) -> BookManager.delete(context, book, (ok, message) -> {
++                    if (message != null) {
++                        Toast.makeText(appContext, message, Toast.LENGTH_SHORT).show();
++                    }
++                    if (ok && onChanged != null) {
++                        onChanged.run();
++                    }
++                }))
++                .setNegativeButton("取消", null)
++                .show();
++    }
++
++    private static EditText buildInput(Context context, String initial) {
++        EditText input = new EditText(context);
++        input.setInputType(InputType.TYPE_CLASS_TEXT);
++        input.setSingleLine(true);
++        input.setImeOptions(EditorInfo.IME_ACTION_DONE);
++        input.setHint("账本名称");
++        if (initial != null && !initial.isEmpty()) {
++            input.setText(initial);
++            input.setSelection(initial.length());
++        }
++        int pad = (int) (context.getResources().getDisplayMetrics().density * 20);
++        input.setPadding(pad, pad, pad, pad);
++        return input;
++    }
++}
+diff --git a/app/src/main/java/com/example/budgetapp/ui/DetailsAdapter.java b/app/src/main/java/com/example/budgetapp/ui/DetailsAdapter.java
+index 5cc5ef5..40f62de 100644
+--- a/app/src/main/java/com/example/budgetapp/ui/DetailsAdapter.java
++++ b/app/src/main/java/com/example/budgetapp/ui/DetailsAdapter.java
+@@ -163,9 +163,31 @@ public class DetailsAdapter extends RecyclerView.Adapter<DetailsAdapter.ViewHold
+             holder.tvSubCategory.setVisibility(View.GONE);
+         }
+ 
++        // 组合显示：备注 + 标签 + 手续费
++        StringBuilder noteText = new StringBuilder();
+         if (!TextUtils.isEmpty(current.note)) {
++            noteText.append(current.note);
++        }
++        if (!TextUtils.isEmpty(current.tags)) {
++            for (String tag : current.tags.split(",")) {
++                String t = tag.trim();
++                if (!t.isEmpty()) {
++                    if (noteText.length() > 0) noteText.append("  ");
++                    noteText.append("#").append(t);
++                }
++            }
++        }
++        if (current.fee != 0) {
++            if (noteText.length() > 0) noteText.append("  ");
++            if (current.fee < 0) {
++                noteText.append("手续费¥").append(String.format(Locale.CHINA, "%.2f", Math.abs(current.fee)));
++            } else {
++                noteText.append("优惠¥").append(String.format(Locale.CHINA, "%.2f", current.fee));
++            }
++        }
++        if (noteText.length() > 0) {
+             holder.tvNote.setVisibility(View.VISIBLE);
+-            holder.tvNote.setText(current.note);
++            holder.tvNote.setText(noteText.toString());
+         } else {
+             holder.tvNote.setVisibility(View.GONE);
+         }
+diff --git a/app/src/main/java/com/example/budgetapp/ui/RecordFragment.java b/app/src/main/java/com/example/budgetapp/ui/RecordFragment.java
+index 3615d61..f3bcbf7 100644
+--- a/app/src/main/java/com/example/budgetapp/ui/RecordFragment.java
++++ b/app/src/main/java/com/example/budgetapp/ui/RecordFragment.java
+@@ -87,6 +87,8 @@ public class RecordFragment extends Fragment {
+     // UI 控件
+     private TextView tvMonthTitle;
+     private TextView tvMonthLabel;
++    // 【多账本】当前账本入口
++    private TextView tvCurrentBook;
+ 
+     private TextView tvIncome, tvExpense, tvBalance, tvOvertime;
+     private LinearLayout layoutIncome, layoutExpense, layoutBalance, layoutOvertime;
+@@ -306,6 +308,26 @@ public class RecordFragment extends Fragment {
+ 
+         tvMonthTitle = view.findViewById(R.id.tv_month_title);
+         tvMonthLabel = view.findViewById(R.id.tv_month_label);
++
++        // 【多账本】当前账本：点击切换，长按管理
++        tvCurrentBook = view.findViewById(R.id.tv_current_book);
++        updateCurrentBookLabel();
++        if (tvCurrentBook != null) {
++            tvCurrentBook.setOnClickListener(v ->
++                    com.example.budgetapp.ui.BookDialogs.showBookPicker(requireContext(), this::onBookChanged));
++            tvCurrentBook.setOnLongClickListener(v -> {
++                com.example.budgetapp.util.BookManager.loadBooks(requireContext(), books -> {
++                    int currentId = com.example.budgetapp.util.BookManager.getCurrentBookId(requireContext());
++                    for (com.example.budgetapp.database.Book b : books) {
++                        if (b.id == currentId) {
++                            com.example.budgetapp.ui.BookDialogs.showManageDialog(requireContext(), b, this::onBookChanged);
++                            break;
++                        }
++                    }
++                });
++                return true;
++            });
++        }
+         tvIncome = view.findViewById(R.id.tv_month_income);
+         tvExpense = view.findViewById(R.id.tv_month_expense);
+         tvBalance = view.findViewById(R.id.tv_month_balance);
+@@ -484,6 +506,22 @@ public class RecordFragment extends Fragment {
+         return view;
+     }
+ 
++    /** 【多账本】刷新顶部“当前账本”标签 */
++    private void updateCurrentBookLabel() {
++        if (tvCurrentBook == null || getContext() == null) {
++            return;
++        }
++        tvCurrentBook.setText(com.example.budgetapp.util.BookManager.getCurrentBookName(requireContext()) + " ▾");
++    }
++
++    /** 【多账本】账本切换/管理之后：更新标签并刷新界面数据 */
++    private void onBookChanged() {
++        updateCurrentBookLabel();
++        if (currentStartMillis > 0 && currentEndMillis > 0) {
++            viewModel.setDateRange(currentStartMillis, currentEndMillis);
++        }
++    }
++
+     private void updateBudgetCard(List<Transaction> transactions) {
+         if (transactions == null || getContext() == null) return;
+ 
+diff --git a/app/src/main/java/com/example/budgetapp/ui/SettingsActivity.java b/app/src/main/java/com/example/budgetapp/ui/SettingsActivity.java
+index 08af571..0ad4c01 100644
+--- a/app/src/main/java/com/example/budgetapp/ui/SettingsActivity.java
++++ b/app/src/main/java/com/example/budgetapp/ui/SettingsActivity.java
+@@ -444,7 +444,8 @@ public class SettingsActivity extends AppCompatActivity {
+         });
+ 
+         financeViewModel = new ViewModelProvider(this).get(FinanceViewModel.class);
+-        financeViewModel.getAllTransactions().observe(this, list -> allTransactions = list);
++        // 【多账本】设置页的导出/导入/查重必须针对所有账本
++        financeViewModel.getAllTransactionsAllBooks().observe(this, list -> allTransactions = list);
+         financeViewModel.getAllAssets().observe(this, list -> allAssets = list);
+ 
+         findViewById(R.id.btn_category_setting).setOnClickListener(v -> startActivity(new Intent(this, CategorySettingsActivity.class)));
+diff --git a/app/src/main/java/com/example/budgetapp/ui/TransactionListAdapter.java b/app/src/main/java/com/example/budgetapp/ui/TransactionListAdapter.java
+index a0f4250..66e31e6 100644
+--- a/app/src/main/java/com/example/budgetapp/ui/TransactionListAdapter.java
++++ b/app/src/main/java/com/example/budgetapp/ui/TransactionListAdapter.java
+@@ -18,6 +18,7 @@ import java.time.LocalDate;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ 
+ public class TransactionListAdapter extends RecyclerView.Adapter<TransactionListAdapter.ViewHolder> {
+@@ -119,10 +120,31 @@ public class TransactionListAdapter extends RecyclerView.Adapter<TransactionList
+             holder.tvSubCategory.setVisibility(View.GONE);
+         }
+ 
+-        // 备注标识
++        // 备注标识（含标签、手续费）
++        StringBuilder noteText = new StringBuilder();
+         if (t.note != null && !t.note.isEmpty()) {
++            noteText.append(t.note);
++        }
++        if (!TextUtils.isEmpty(t.tags)) {
++            for (String tag : t.tags.split(",")) {
++                String tg = tag.trim();
++                if (!tg.isEmpty()) {
++                    if (noteText.length() > 0) noteText.append("  ");
++                    noteText.append("#").append(tg);
++                }
++            }
++        }
++        if (t.fee != 0) {
++            if (noteText.length() > 0) noteText.append("  ");
++            if (t.fee < 0) {
++                noteText.append("手续费¥").append(String.format(Locale.CHINA, "%.2f", Math.abs(t.fee)));
++            } else {
++                noteText.append("优惠¥").append(String.format(Locale.CHINA, "%.2f", t.fee));
++            }
++        }
++        if (noteText.length() > 0) {
+             holder.tvNote.setVisibility(View.VISIBLE);
+-            holder.tvNote.setText(t.note);
++            holder.tvNote.setText(noteText.toString());
+         } else {
+             holder.tvNote.setVisibility(View.GONE);
+         }
+diff --git a/app/src/main/java/com/example/budgetapp/util/BookManager.java b/app/src/main/java/com/example/budgetapp/util/BookManager.java
+new file mode 100644
+index 0000000..b9780c3
+--- /dev/null
++++ b/app/src/main/java/com/example/budgetapp/util/BookManager.java
+@@ -0,0 +1,404 @@
++package com.example.budgetapp.util;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++import android.os.Handler;
++import android.os.Looper;
++import android.text.TextUtils;
++
++import androidx.annotation.NonNull;
++
++import com.example.budgetapp.database.AppDatabase;
++import com.example.budgetapp.database.Book;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.CopyOnWriteArrayList;
++
++/**
++ * 多账本管理。
++ *
++ * <p>职责：</p>
++ * <ul>
++ *   <li>数据库中的 {@code books.isCurrent} 是“查询按哪个账本过滤”的唯一依据；</li>
++ *   <li>SharedPreferences 缓存当前账本的 id/名称，供界面直接读取（避免主线程查库）；</li>
++ *   <li>所有写操作都在后台线程执行，并在完成后回调主线程。</li>
++ * </ul>
++ */
++public class BookManager {
++
++    private static final String PREFS = "book_prefs";
++    private static final String KEY_CURRENT_ID = "current_book_id";
++    private static final String KEY_CURRENT_NAME = "current_book_name";
++
++    /** 账本变化监听（界面刷新用） */
++    private static final List<Runnable> LISTENERS = new CopyOnWriteArrayList<>();
++
++    private static final Handler MAIN = new Handler(Looper.getMainLooper());
++
++    private BookManager() {
++    }
++
++    // ================= 当前账本（主线程可读） =================
++
++    public static int getCurrentBookId(Context context) {
++        return prefs(context).getInt(KEY_CURRENT_ID, Book.DEFAULT_BOOK_ID);
++    }
++
++    @NonNull
++    public static String getCurrentBookName(Context context) {
++        String name = prefs(context).getString(KEY_CURRENT_NAME, Book.DEFAULT_BOOK_NAME);
++        return TextUtils.isEmpty(name) ? Book.DEFAULT_BOOK_NAME : name;
++    }
++
++    // ================= 监听 =================
++
++    public static void addListener(Runnable listener) {
++        if (listener != null && !LISTENERS.contains(listener)) {
++            LISTENERS.add(listener);
++        }
++    }
++
++    public static void removeListener(Runnable listener) {
++        LISTENERS.remove(listener);
++    }
++
++    private static void notifyChanged() {
++        MAIN.post(() -> {
++            for (Runnable r : LISTENERS) {
++                try {
++                    r.run();
++                } catch (Exception ignored) {
++                    // 单个监听异常不影响其它界面
++                }
++            }
++        });
++    }
++
++    // ================= 异步接口 =================
++
++    public interface Callback {
++        /** @param message 供界面提示的文案；成功时可为 null */
++        void onDone(boolean ok, String message);
++    }
++
++    public interface BooksCallback {
++        void onBooks(List<Book> books);
++    }
++
++    /** 读取全部账本（后台线程查库，回调在主线程） */
++    public static void loadBooks(Context context, BooksCallback callback) {
++        final Context app = context.getApplicationContext();
++        AppDatabase.databaseWriteExecutor.execute(() -> {
++            final List<Book> books = safeList(app);
++            MAIN.post(() -> callback.onBooks(books));
++        });
++    }
++
++    /** 切换到指定账本 */
++    public static void setCurrent(Context context, Book book, Callback callback) {
++        final Context app = context.getApplicationContext();
++        AppDatabase.databaseWriteExecutor.execute(() -> {
++            boolean ok = true;
++            String message = null;
++            try {
++                AppDatabase db = AppDatabase.getDatabase(app);
++                db.bookDao().clearCurrent();
++                db.bookDao().markCurrent(book.id);
++                // 账单表未变更，但界面需要按新账本重新查询：触发一次失效通知
++                db.bookDao().touchTransactions();
++                prefs(app).edit()
++                        .putInt(KEY_CURRENT_ID, book.id)
++                        .putString(KEY_CURRENT_NAME, book.name)
++                        .apply();
++                // 桌面小组件展示当前账本数据，切换后立即刷新
++                com.example.budgetapp.widget.WidgetUtils.updateAllWidgets(app);
++            } catch (Exception e) {
++                ok = false;
++                message = "切换账本失败：" + e.getMessage();
++            }
++            final boolean fOk = ok;
++            final String fMsg = message;
++            MAIN.post(() -> {
++                if (fOk) {
++                    notifyChanged();
++                }
++                if (callback != null) {
++                    callback.onDone(fOk, fMsg);
++                }
++            });
++        });
++    }
++
++    /** 新建账本并切换过去 */
++    public static void createAndSwitch(Context context, String name, Callback callback) {
++        create(context, name, true, callback);
++    }
++
++    /** 新建账本（不切换） */
++    public static void create(Context context, String name, Callback callback) {
++        create(context, name, false, callback);
++    }
++
++    private static void create(Context context, String name, boolean switchTo, Callback callback) {
++        final Context app = context.getApplicationContext();
++        final String trimmed = name == null ? "" : name.trim();
++        if (trimmed.isEmpty()) {
++            if (callback != null) {
++                callback.onDone(false, "账本名称不能为空");
++            }
++            return;
++        }
++        AppDatabase.databaseWriteExecutor.execute(() -> {
++            boolean ok = true;
++            String message = null;
++            try {
++                AppDatabase db = AppDatabase.getDatabase(app);
++                if (db.bookDao().getByNameSync(trimmed) != null) {
++                    ok = false;
++                    message = "已存在同名账本";
++                } else {
++                    Book book = new Book(trimmed, db.bookDao().countSync());
++                    long id = db.bookDao().insert(book);
++                    if (switchTo) {
++                        db.bookDao().clearCurrent();
++                        db.bookDao().markCurrent((int) id);
++                        db.bookDao().touchTransactions();
++                        prefs(app).edit()
++                                .putInt(KEY_CURRENT_ID, (int) id)
++                                .putString(KEY_CURRENT_NAME, trimmed)
++                                .apply();
++                    }
++                }
++            } catch (Exception e) {
++                ok = false;
++                message = "新建账本失败：" + e.getMessage();
++            }
++            final boolean fOk = ok;
++            final String fMsg = message;
++            MAIN.post(() -> {
++                if (fOk) {
++                    notifyChanged();
++                }
++                if (callback != null) {
++                    callback.onDone(fOk, fMsg);
++                }
++            });
++        });
++    }
++
++    /** 重命名账本 */
++    public static void rename(Context context, Book book, String newName, Callback callback) {
++        final Context app = context.getApplicationContext();
++        final String trimmed = newName == null ? "" : newName.trim();
++        if (trimmed.isEmpty()) {
++            if (callback != null) {
++                callback.onDone(false, "账本名称不能为空");
++            }
++            return;
++        }
++        AppDatabase.databaseWriteExecutor.execute(() -> {
++            boolean ok = true;
++            String message = null;
++            try {
++                AppDatabase db = AppDatabase.getDatabase(app);
++                Book same = db.bookDao().getByNameSync(trimmed);
++                if (same != null && same.id != book.id) {
++                    ok = false;
++                    message = "已存在同名账本";
++                } else {
++                    book.name = trimmed;
++                    db.bookDao().update(book);
++                    if (getCurrentBookId(app) == book.id) {
++                        prefs(app).edit().putString(KEY_CURRENT_NAME, trimmed).apply();
++                    }
++                }
++            } catch (Exception e) {
++                ok = false;
++                message = "重命名失败：" + e.getMessage();
++            }
++            final boolean fOk = ok;
++            final String fMsg = message;
++            MAIN.post(() -> {
++                if (fOk) {
++                    notifyChanged();
++                }
++                if (callback != null) {
++                    callback.onDone(fOk, fMsg);
++                }
++            });
++        });
++    }
++
++    /**
++     * 删除账本。
++     *
++     * <p>若该账本下还有账单，会先迁移到另一个账本（优先默认账本），不会丢数据。</p>
++     */
++    public static void delete(Context context, Book book, Callback callback) {
++        final Context app = context.getApplicationContext();
++        AppDatabase.databaseWriteExecutor.execute(() -> {
++            boolean ok = true;
++            String message = null;
++            try {
++                AppDatabase db = AppDatabase.getDatabase(app);
++                List<Book> all = safeList(app);
++                if (all.size() <= 1) {
++                    ok = false;
++                    message = "至少要保留一个账本";
++                } else {
++                    // 迁移账单到另一个账本
++                    int targetId = -1;
++                    for (Book b : all) {
++                        if (b.id != book.id && b.id == Book.DEFAULT_BOOK_ID) {
++                            targetId = b.id;
++                            break;
++                        }
++                    }
++                    if (targetId == -1) {
++                        for (Book b : all) {
++                            if (b.id != book.id) {
++                                targetId = b.id;
++                                break;
++                            }
++                        }
++                    }
++                    int moved = db.bookDao().countTransactions(book.id);
++                    if (moved > 0 && targetId != -1) {
++                        db.bookDao().reassignTransactions(book.id, targetId);
++                    }
++                    // 若删的是当前账本，切换目标账本
++                    if (getCurrentBookId(app) == book.id && targetId != -1) {
++                        db.bookDao().clearCurrent();
++                        db.bookDao().markCurrent(targetId);
++                        Book target = db.bookDao().getByIdSync(targetId);
++                        if (target != null) {
++                            prefs(app).edit()
++                                    .putInt(KEY_CURRENT_ID, target.id)
++                                    .putString(KEY_CURRENT_NAME, target.name)
++                                    .apply();
++                        }
++                    }
++                    db.bookDao().deleteById(book.id);
++                    db.bookDao().touchTransactions();
++                    if (moved > 0) {
++                        message = "已删除账本，其 " + moved + " 条账单已迁移到其它账本";
++                    }
++                }
++            } catch (Exception e) {
++                ok = false;
++                message = "删除账本失败：" + e.getMessage();
++            }
++            final boolean fOk = ok;
++            final String fMsg = message;
++            MAIN.post(() -> {
++                if (fOk) {
++                    notifyChanged();
++                }
++                if (callback != null) {
++                    callback.onDone(fOk, fMsg);
++                }
++            });
++        });
++    }
++
++    /**
++     * 按名称查找账本，不存在则创建；返回账本 ID。
++     *
++     * <p><b>仅限后台线程调用</b>（会同步查库）。供外部记账接口写入指定账本使用。</p>
++     */
++    public static int ensureBookIdSync(Context context, String name) {
++        try {
++            AppDatabase db = AppDatabase.getDatabase(context);
++            String trimmed = name == null ? "" : name.trim();
++            if (trimmed.isEmpty()) {
++                Book current = db.bookDao().getCurrentSync();
++                return current != null ? current.id : Book.DEFAULT_BOOK_ID;
++            }
++            Book existing = db.bookDao().getByNameSync(trimmed);
++            if (existing != null) {
++                return existing.id;
++            }
++            Book created = new Book(trimmed, db.bookDao().countSync());
++            long id = db.bookDao().insert(created);
++            return (int) id;
++        } catch (Exception e) {
++            return Book.DEFAULT_BOOK_ID;
++        }
++    }
++
++    // ================= 内部 =================
++
++    /**
++     * 校正账本数据（<b>仅限后台线程</b>，App 启动时调用）。
++     *
++     * <p>处理三种异常情况：</p>
++     * <ol>
++     *   <li>账本表为空（异常或旧库）→ 建立默认账本；</li>
++     *   <li>没有任何“当前账本” → 取第一个账本设为当前；</li>
++     *   <li>账单指向了账本表中不存在的账本（例如恢复了其它设备的备份）→ 按原 ID 补建账本。</li>
++     * </ol>
++     */
++    public static void reconcileBooksSync(Context context) {
++        try {
++            AppDatabase db = AppDatabase.getDatabase(context);
++            List<Book> books = db.bookDao().getAllSync();
++            if (books == null || books.isEmpty()) {
++                Book def = new Book(Book.DEFAULT_BOOK_NAME, 0);
++                def.id = Book.DEFAULT_BOOK_ID;
++                def.isCurrent = true;
++                db.bookDao().insert(def);
++                prefs(context).edit()
++                        .putInt(KEY_CURRENT_ID, def.id)
++                        .putString(KEY_CURRENT_NAME, def.name)
++                        .apply();
++            }
++
++            Book current = db.bookDao().getCurrentSync();
++            if (current == null) {
++                List<Book> all = db.bookDao().getAllSync();
++                if (all != null && !all.isEmpty()) {
++                    Book first = all.get(0);
++                    db.bookDao().clearCurrent();
++                    db.bookDao().markCurrent(first.id);
++                    current = first;
++                }
++            }
++            if (current != null) {
++                prefs(context).edit()
++                        .putInt(KEY_CURRENT_ID, current.id)
++                        .putString(KEY_CURRENT_NAME, current.name)
++                        .apply();
++            }
++
++            List<Integer> usedIds = db.bookDao().distinctTransactionBookIds();
++            if (usedIds != null) {
++                for (Integer id : usedIds) {
++                    if (id == null || id <= 0) {
++                        continue;
++                    }
++                    if (db.bookDao().getByIdSync(id) == null) {
++                        Book orphan = new Book("账本 " + id, db.bookDao().countSync());
++                        orphan.id = id;
++                        db.bookDao().insert(orphan);
++                    }
++                }
++            }
++        } catch (Exception ignored) {
++            // 校正失败不影响正常使用
++        }
++    }
++
++    private static List<Book> safeList(Context context) {
++        try {
++            List<Book> list = AppDatabase.getDatabase(context).bookDao().getAllSync();
++            return list != null ? list : new ArrayList<>();
++        } catch (Exception e) {
++            return new ArrayList<>();
++        }
++    }
++
++    private static SharedPreferences prefs(Context context) {
++        return context.getApplicationContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE);
++    }
++}
+diff --git a/app/src/main/java/com/example/budgetapp/viewmodel/FinanceViewModel.java b/app/src/main/java/com/example/budgetapp/viewmodel/FinanceViewModel.java
+index 3a7dd8b..8352062 100644
+--- a/app/src/main/java/com/example/budgetapp/viewmodel/FinanceViewModel.java
++++ b/app/src/main/java/com/example/budgetapp/viewmodel/FinanceViewModel.java
+@@ -36,6 +36,8 @@ public class FinanceViewModel extends AndroidViewModel {
+     private final AppDatabase database; // 显式持有数据库引用以供 DAO 访问
+ 
+     private final LiveData<List<Transaction>> allTransactions;
++    /** 【多账本】所有账本的账单（备份/导出/导入使用） */
++    private final LiveData<List<Transaction>> allTransactionsAllBooks;
+     private final LiveData<List<AssetAccount>> allAssets;
+     private final LiveData<List<Goal>> allGoals; // 新增 LiveData 观察存储目标
+ 
+@@ -57,6 +59,8 @@ public class FinanceViewModel extends AndroidViewModel {
+ 
+         // 3. 初始化 LiveData (观察者模式)
+         allTransactions = transactionDao.getAllTransactions();
++        // 【多账本】备份/导出必须包含所有账本，避免其它账本数据丢失
++        allTransactionsAllBooks = transactionDao.getAllTransactionsAllBooks();
+         allAssets = assetDao.getAllAssets();
+         allGoals = goalDao.getAllGoals(); // 获取所有目标
+ 
+@@ -138,6 +142,11 @@ public class FinanceViewModel extends AndroidViewModel {
+         return allTransactions;
+     }
+ 
++    /** 【多账本】所有账本的账单（备份/导出/导入使用，不受当前账本限制） */
++    public LiveData<List<Transaction>> getAllTransactionsAllBooks() {
++        return allTransactionsAllBooks;
++    }
++
+     public void addTransaction(Transaction transaction) {
+         AppDatabase.databaseWriteExecutor.execute(() -> {
+             transactionDao.insert(transaction);
+diff --git a/app/src/main/res/drawable/bg_book_chip.xml b/app/src/main/res/drawable/bg_book_chip.xml
+new file mode 100644
+index 0000000..3718649
+--- /dev/null
++++ b/app/src/main/res/drawable/bg_book_chip.xml
+@@ -0,0 +1,10 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- 【多账本】当前账本标签背景 -->
++<shape xmlns:android="http://schemas.android.com/apk/res/android"
++    android:shape="rectangle">
++    <corners android:radius="14dp" />
++    <solid android:color="#14000000" />
++    <stroke
++        android:width="1dp"
++        android:color="#22000000" />
++</shape>
+diff --git a/app/src/main/res/layout/fragment_record.xml b/app/src/main/res/layout/fragment_record.xml
+index 0b4f43b..9b9c2e4 100644
+--- a/app/src/main/res/layout/fragment_record.xml
++++ b/app/src/main/res/layout/fragment_record.xml
+@@ -70,6 +70,26 @@
+         android:textSize="32sp"
+         android:textStyle="bold" />
+ 
++    <!-- 【多账本】当前账本入口：点击切换 / 长按管理 -->
++    <TextView
++        android:id="@+id/tv_current_book"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_alignTop="@id/tv_month_label"
++        android:layout_alignBottom="@id/tv_month_label"
++        android:layout_alignParentEnd="true"
++        android:layout_marginEnd="12dp"
++        android:background="@drawable/bg_book_chip"
++        android:gravity="center"
++        android:maxWidth="150dp"
++        android:paddingHorizontal="10dp"
++        android:singleLine="true"
++        android:ellipsize="end"
++        android:text="默认账本 ▾"
++        android:textColor="@color/black"
++        android:textSize="13sp" />
++
++
+     <LinearLayout
+         android:id="@+id/layout_week_header"
+         android:layout_width="match_parent"
