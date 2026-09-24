@@ -1473,7 +1473,7 @@ index 1450e24..74d3106 100644
      List<TransactionMinimal> getMinimalTransactionsSync(long start, long end);
  
      /**
-@@ -96,8 +127,9 @@ public interface TransactionDao {
+@@ -96,7 +127,8 @@ public interface TransactionDao {
       */
      @Query("SELECT DISTINCT CAST(strftime('%m', date / 1000, 'unixepoch', 'localtime') AS INTEGER) " +
              "FROM transactions " +
@@ -1483,9 +1483,6 @@ index 1450e24..74d3106 100644
              "AND type IN (0, 1) AND category != '资产互转'")
      List<Integer> getMonthsWithDataSync(long start, long end);
  
--}
-\ No newline at end of file
-+}
 diff --git a/app/src/main/java/com/example/budgetapp/ui/BookDialogs.java b/app/src/main/java/com/example/budgetapp/ui/BookDialogs.java
 new file mode 100644
 index 0000000..8e9270d
