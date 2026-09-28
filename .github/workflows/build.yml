@@ -17,12 +17,24 @@ jobs:
         uses: actions/setup-java@v4
         with: {java-version: "17", distribution: "microsoft"}
       - if: steps.patch.outputs.ok == 'true'
-        run: cd upstream && chmod +x gradlew && ./gradlew :app:assembleDebug --no-daemon
+        run: cd upstream && chmod +x gradlew && ./gradlew :app:assembleRelease --no-daemon
+      - if: steps.patch.outputs.ok == 'true'
+        name: Sign APK
+        run: |
+          cd upstream
+          echo "$KEYSTORE_BASE64" | base64 -d > /tmp/ks.jks
+          $ANDROID_HOME/build-tools/*/zipalign -p -f 4 app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
+          $ANDROID_HOME/build-tools/*/apksigner sign --ks /tmp/ks.jks --ks-key-alias "$KEY_ALIAS" --ks-pass pass:"$KEYSTORE_PASS" --key-pass pass:"$KEY_PASS" --out "Tally-auto-${{ steps.up.outputs.sha }}.apk" aligned.apk
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASS }}
       - if: steps.patch.outputs.ok == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "tally-${{ steps.up.outputs.sha }}"
-          files: upstream/app/build/outputs/apk/debug/*.apk
+          files: upstream/Tally-auto-*.apk
       - if: steps.patch.outputs.ok == 'false'
         continue-on-error: true
         uses: actions/github-script@v7
