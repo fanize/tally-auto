@@ -14,6 +14,13 @@ jobs:
       - id: patch
         run: cd upstream && (git apply ../patches/tally-auto.patch && echo "ok=true" >> $GITHUB_OUTPUT) || (echo "ok=false" >> $GITHUB_OUTPUT && echo "Patch failed")
       - if: steps.patch.outputs.ok == 'true'
+        name: Fix Maven mirrors for GitHub Actions
+        run: |
+          cd upstream
+          sed -i 's|maven { url = uri("https://maven.aliyun.com/repository/public") }|google()\n        mavenCentral()|g' settings.gradle.kts
+          sed -i 's|maven { url = uri("https://maven.aliyun.com/repository/google") }||g' settings.gradle.kts
+          sed -i 's|maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }|gradlePluginPortal()|g' settings.gradle.kts
+      - if: steps.patch.outputs.ok == 'true'
         uses: actions/setup-java@v4
         with: {java-version: "17", distribution: "microsoft"}
       - if: steps.patch.outputs.ok == 'true'
