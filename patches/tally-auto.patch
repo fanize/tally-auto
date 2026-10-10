@@ -1,18 +1,20 @@
 diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
-index 2ebd1c4..aae38d8 100644
+index b606e68..94b6ca5 100644
 --- a/app/src/main/AndroidManifest.xml
 +++ b/app/src/main/AndroidManifest.xml
-@@ -95,6 +95,34 @@
+@@ -106,6 +106,36 @@
              android:excludeFromRecents="true"
              android:launchMode="singleTop"/>
  
-+        <!-- 外部记账接口（自动化记账用，无界面）：tally://publicapi/addbill?... -->
++        <!-- 外部记账接口（自动化记账用，无界面）：tally://publicapi/addbill?...
++             taskAffinity="" = 独立任务栈，启动时不会把 Tally 主界面拉到前台 -->
 +        <activity
 +            android:name=".api.TallyApiActivity"
 +            android:exported="true"
-+            android:theme="@style/Theme.BudgetApp.Transparent"
++            android:theme="@style/Theme.BudgetApp.NoDisplay"
 +            android:excludeFromRecents="true"
 +            android:noHistory="true"
++            android:taskAffinity=""
 +            android:launchMode="singleTop">
 +            <intent-filter>
 +                <action android:name="android.intent.action.VIEW" />
@@ -37,8 +39,98 @@ index 2ebd1c4..aae38d8 100644
          <activity
              android:name=".ui.AboutActivity"
              android:label="关于"
+diff --git a/app/src/main/java/com/example/budgetapp/BackupData.java b/app/src/main/java/com/example/budgetapp/BackupData.java
+index e17c08d..39c7f4c 100644
+--- a/app/src/main/java/com/example/budgetapp/BackupData.java
++++ b/app/src/main/java/com/example/budgetapp/BackupData.java
+@@ -1,6 +1,7 @@
+ package com.example.budgetapp;
+ 
+ import com.example.budgetapp.database.AssetAccount;
++import com.example.budgetapp.database.Book;
+ import com.example.budgetapp.database.Goal;
+ import com.example.budgetapp.database.Transaction;
+ import com.example.budgetapp.database.RenewalItem;
+@@ -30,6 +31,14 @@ public class BackupData {
+ 
+     public List<Transaction> records;
+ 
++    /**
++     * 【多账本】账本表。
++     *
++     * <p>旧备份没有这个字段（为 null）：恢复端会按账单引用到的 bookId 补建账本，
++     * 避免账本缺失导致账单被“当前账本”过滤而看起来全部消失。</p>
++     */
++    public List<Book> books;
++
+     public BackupData() {}
+ 
+     public BackupData(List<Transaction> records, List<AssetAccount> assets, List<Goal> goals) {
+diff --git a/app/src/main/java/com/example/budgetapp/BackupManager.java b/app/src/main/java/com/example/budgetapp/BackupManager.java
+index 425a1c9..4e8bf2d 100644
+--- a/app/src/main/java/com/example/budgetapp/BackupManager.java
++++ b/app/src/main/java/com/example/budgetapp/BackupManager.java
+@@ -99,6 +99,13 @@ public class BackupManager {
+         List<com.example.budgetapp.database.RecurringRule> recurringRules = db.recurringRuleDao().getAllRulesSync();
+         data.recurringRules = recurringRules;
+ 
++        // 【多账本】保存账本表（否则恢复后账单会因“账本不存在”被过滤隐藏）
++        try {
++            data.books = db.bookDao().getAllSync();
++        } catch (Exception e) {
++            Log.e("BackupManager", "导出账本失败", e);
++        }
++
+         // 【修复】携带原始数据类型保存 SharedPreferences
+         SharedPreferences prefs = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE);
+         Map<String, BackupData.PrefItem> prefsMap = new HashMap<>();
+@@ -1283,6 +1290,22 @@ public class BackupManager {
+                         editor.apply();
+                     }
+ 
++                    // 【多账本】恢复账本表；若备份里没有账本信息（旧备份），
++                    // 则为账单引用到的 bookId 补建账本，避免恢复后账单被“当前账本”过滤而消失。
++                    try {
++                        List<Integer> referencedBookIds = new ArrayList<>();
++                        if (data.records != null) {
++                            for (Transaction t : data.records) {
++                                if (t != null && t.bookId > 0 && !referencedBookIds.contains(t.bookId)) {
++                                    referencedBookIds.add(t.bookId);
++                                }
++                            }
++                        }
++                        com.example.budgetapp.util.BookManager.restoreBooksSync(context, data.books, referencedBookIds);
++                    } catch (Exception e) {
++                        Log.e("BackupManager", "恢复账本失败", e);
++                    }
++
+                     return data;
+                 }
+             }
+@@ -2438,6 +2461,21 @@ public class BackupManager {
+                         }
+                         editor.apply();
+                     }
++
++                    // 【多账本】恢复账本表（WebDAV 恢复同理，避免账单因账本缺失被过滤隐藏）
++                    try {
++                        List<Integer> referencedBookIds = new ArrayList<>();
++                        if (data.records != null) {
++                            for (Transaction t : data.records) {
++                                if (t != null && t.bookId > 0 && !referencedBookIds.contains(t.bookId)) {
++                                    referencedBookIds.add(t.bookId);
++                                }
++                            }
++                        }
++                        com.example.budgetapp.util.BookManager.restoreBooksSync(context, data.books, referencedBookIds);
++                    } catch (Exception e) {
++                        Log.e("BackupManager", "恢复账本失败", e);
++                    }
+                     return data; // 返回解析后的数据供数据库操作
+                 }
+             }
 diff --git a/app/src/main/java/com/example/budgetapp/MainActivity.java b/app/src/main/java/com/example/budgetapp/MainActivity.java
-index 5eefbc2..31dbde3 100644
+index e922d20..38dd42c 100644
 --- a/app/src/main/java/com/example/budgetapp/MainActivity.java
 +++ b/app/src/main/java/com/example/budgetapp/MainActivity.java
 @@ -155,7 +155,8 @@ public class MainActivity extends AppCompatActivity {
@@ -52,18 +144,26 @@ index 5eefbc2..31dbde3 100644
          });
  
 diff --git a/app/src/main/java/com/example/budgetapp/MyApplication.java b/app/src/main/java/com/example/budgetapp/MyApplication.java
-index 7019706..3dfe86e 100644
+index 61b1a88..39d304e 100644
 --- a/app/src/main/java/com/example/budgetapp/MyApplication.java
 +++ b/app/src/main/java/com/example/budgetapp/MyApplication.java
-@@ -81,5 +81,9 @@ public class MyApplication extends Application {
-             } catch (Exception ignored) {
-             }
-         });
+@@ -113,6 +113,11 @@ public class MyApplication extends Application {
+ 
+         // 【周期记账】初始化WorkManager定时任务
+          scheduleRecurringTransactionWorker();
 +
-+        // 【多账本】启动时校正账本数据（恢复备份后可能存在“账单指向不存在的账本”）
++        // 【多账本】启动时校正账本数据（恢复备份后可能存在“账单指向不存在的账本”，
++        // 以及编辑保存把 bookId 写成 0 的“消失账单”）
 +        com.example.budgetapp.database.AppDatabase.databaseWriteExecutor.execute(() ->
 +                com.example.budgetapp.util.BookManager.reconcileBooksSync(this));
- }
+     }
+ 
+     /**
+@@ -142,5 +147,4 @@ public class MyApplication extends Application {
+             e.printStackTrace();
+         }
+     }
+-
  }
 \ No newline at end of file
 diff --git a/app/src/main/java/com/example/budgetapp/api/TallyApi.java b/app/src/main/java/com/example/budgetapp/api/TallyApi.java
@@ -384,90 +484,60 @@ index 0000000..7316c58
 +}
 diff --git a/app/src/main/java/com/example/budgetapp/api/TallyApiActivity.java b/app/src/main/java/com/example/budgetapp/api/TallyApiActivity.java
 new file mode 100644
-index 0000000..c990d9d
+index 0000000..b9eedc5
 --- /dev/null
 +++ b/app/src/main/java/com/example/budgetapp/api/TallyApiActivity.java
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,52 @@
 +package com.example.budgetapp.api;
 +
 +import android.app.Activity;
++import android.content.Intent;
 +import android.net.Uri;
 +import android.os.Bundle;
-+import android.os.Handler;
-+import android.os.Looper;
-+import android.widget.Toast;
 +
 +/**
-+ * 外部记账接口入口（无界面）。
++ * 外部记账接口入口（完全无界面）。
 + *
-+ * <p>由自动化工具（如 AutoAccounting）通过 {@code tally://publicapi/addbill?...} 调起，
-+ * 写入完成后自动结束；{@code showresult=0} 时完全静默。</p>
++ * <p>使用 {@code Theme.NoDisplay} 主题——不显示任何窗口、不抢焦点、不闪屏。
++ * 解析参数后立即 {@link #finish()}，写库在后台线程完成，结果通过<b>系统通知</b>告知。</p>
 + *
-+ * <p>此 Activity 不展示任何界面（透明主题、不进最近任务），只负责解析参数并交给
-+ * {@link TallyApiWriter} 写库。写入在后台线程执行，本 Activity 会等待回调再结束，
-+ * 以确保进程不会在写库完成前被回收。</p>
++ * <p><b>支持快速连续调用</b>：AA 批量同步时每 500ms 发一个 Intent，
++ * 本 Activity 立即 finish 后系统会为下一个 Intent 创建新实例，互不干扰。</p>
 + */
 +public class TallyApiActivity extends Activity {
-+
-+    /** 最长等待写入结果的时间，避免异常情况下界面残留 */
-+    private static final long WRITE_TIMEOUT_MS = 10_000L;
-+
-+    private final Handler handler = new Handler(Looper.getMainLooper());
-+    private boolean finished = false;
 +
 +    @Override
 +    protected void onCreate(Bundle savedInstanceState) {
 +        super.onCreate(savedInstanceState);
++        handleIntent(getIntent());
++        // Theme.NoDisplay 要求在 onResume 之前 finish
++        finish();
++    }
 +
-+        Uri data = getIntent() != null ? getIntent().getData() : null;
++    @Override
++    protected void onNewIntent(Intent intent) {
++        super.onNewIntent(intent);
++        handleIntent(intent);
++    }
++
++    private void handleIntent(Intent intent) {
++        Uri data = intent != null ? intent.getData() : null;
 +        if (data == null) {
-+            finish();
 +            return;
 +        }
 +
 +        final TallyApi.Bill bill;
 +        try {
 +            bill = TallyApi.parse(data);
-+        } catch (TallyApi.ParseException e) {
-+            toast("Tally 记账参数错误：" + e.getMessage());
-+            finish();
-+            return;
 +        } catch (Exception e) {
-+            toast("Tally 记账失败：" + e.getMessage());
-+            finish();
++            // 参数错误也发通知（静默失败会让用户困惑）
++            TallyApiWriter.postNotification(getApplicationContext(),
++                    "Tally 记账失败", "参数错误：" + e.getMessage());
 +            return;
 +        }
 +
-+        // 安全网：即使写库回调异常丢失，也不会留下透明界面
-+        handler.postDelayed(this::finishOnce, WRITE_TIMEOUT_MS);
-+
-+        TallyApiWriter.write(this, bill, (ok, duplicated, message) -> {
-+            if (bill.showResult) {
-+                toast(message);
-+            }
-+            finishOnce();
-+        });
-+    }
-+
-+    @Override
-+    protected void onDestroy() {
-+        handler.removeCallbacksAndMessages(null);
-+        super.onDestroy();
-+    }
-+
-+    private void finishOnce() {
-+        if (!finished) {
-+            finished = true;
-+            finish();
-+        }
-+    }
-+
-+    private void toast(String message) {
-+        try {
-+            Toast.makeText(getApplicationContext(), message, Toast.LENGTH_SHORT).show();
-+        } catch (Exception ignored) {
-+            // 后台弹 Toast 在部分 ROM 上会失败，忽略
-+        }
++        // 写库在后台线程完成，结果通过系统通知告知
++        TallyApiWriter.write(getApplicationContext(), bill, null);
 +    }
 +}
 diff --git a/app/src/main/java/com/example/budgetapp/api/TallyApiWriter.java b/app/src/main/java/com/example/budgetapp/api/TallyApiWriter.java
@@ -1073,21 +1143,21 @@ index 0000000..718dfee
 +    }
 +}
 diff --git a/app/src/main/java/com/example/budgetapp/database/AppDatabase.java b/app/src/main/java/com/example/budgetapp/database/AppDatabase.java
-index 2e6c2c4..4fd38f8 100644
+index 680da54..1379a73 100644
 --- a/app/src/main/java/com/example/budgetapp/database/AppDatabase.java
 +++ b/app/src/main/java/com/example/budgetapp/database/AppDatabase.java
 @@ -10,7 +10,7 @@ import androidx.annotation.NonNull;
  import java.util.concurrent.ExecutorService;
  import java.util.concurrent.Executors;
  
--@Database(entities = {Transaction.class, AssetAccount.class, Goal.class}, version = 24, exportSchema = false)
-+@Database(entities = {Transaction.class, AssetAccount.class, Goal.class, Book.class}, version = 26, exportSchema = false)
+-@Database(entities = {Transaction.class, AssetAccount.class, Goal.class, RecurringRule.class}, version = 27, exportSchema = false)
++@Database(entities = {Transaction.class, AssetAccount.class, Goal.class, RecurringRule.class, Book.class}, version = 29, exportSchema = false)
  public abstract class AppDatabase extends RoomDatabase {
  
      public abstract TransactionDao transactionDao();
-@@ -18,6 +18,9 @@ public abstract class AppDatabase extends RoomDatabase {
- 
-     public abstract GoalDao goalDao();
+@@ -20,6 +20,9 @@ public abstract class AppDatabase extends RoomDatabase {
+     
+     public abstract RecurringRuleDao recurringRuleDao();
  
 +    /** 【新增】多账本 DAO */
 +    public abstract BookDao bookDao();
@@ -1095,12 +1165,71 @@ index 2e6c2c4..4fd38f8 100644
      private static volatile AppDatabase INSTANCE;
      private static final int NUMBER_OF_THREADS = 4;
      public static final ExecutorService databaseWriteExecutor = Executors.newFixedThreadPool(NUMBER_OF_THREADS);
-@@ -184,6 +187,58 @@ public abstract class AppDatabase extends RoomDatabase {
+@@ -220,15 +223,129 @@ public abstract class AppDatabase extends RoomDatabase {
+     };
+ 
+     // 【周期记账】26 -> 27 的迁移逻辑：为 transactions 表添加索引以优化查询性能
++    // 【修复】写成幂等版本：多账本补丁曾占用过 25/26 版本号，那批旧库缺周期记账字段/表，
++    //        这里先补齐再建索引，避免 "no such column" 导致迁移崩溃。
+     static final Migration MIGRATION_26_27 = new Migration(26, 27) {
+         @Override
+         public void migrate(@NonNull SupportSQLiteDatabase database) {
++            addColumnIfMissing(database, "transactions", "isSettled", "INTEGER NOT NULL DEFAULT 1");
++            addColumnIfMissing(database, "transactions", "recurringRuleId", "INTEGER NOT NULL DEFAULT 0");
++            addColumnIfMissing(database, "transactions", "scheduledExecuteTime", "INTEGER NOT NULL DEFAULT 0");
++            database.execSQL("CREATE TABLE IF NOT EXISTS `recurring_rules` (" +
++                    "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
++                    "`type` INTEGER NOT NULL, " +
++                    "`amount` REAL NOT NULL, " +
++                    "`currencySymbol` TEXT, " +
++                    "`category` TEXT, " +
++                    "`subCategory` TEXT, " +
++                    "`assetId` INTEGER NOT NULL, " +
++                    "`periodUnit` TEXT, " +
++                    "`periodInterval` INTEGER NOT NULL, " +
++                    "`startDate` INTEGER NOT NULL, " +
++                    "`endDate` INTEGER NOT NULL, " +
++                    "`triggerTime` TEXT, " +
++                    "`note` TEXT, " +
++                    "`isEnabled` INTEGER NOT NULL, " +
++                    "`createTime` INTEGER NOT NULL)");
+             database.execSQL("CREATE INDEX IF NOT EXISTS `index_transactions_isSettled` ON `transactions` (`isSettled`)");
+             database.execSQL("CREATE INDEX IF NOT EXISTS `index_transactions_recurringRuleId` ON `transactions` (`recurringRuleId`)");
+             database.execSQL("CREATE INDEX IF NOT EXISTS `index_transactions_scheduledExecuteTime` ON `transactions` (`scheduledExecuteTime`)");
          }
      };
  
-+    // ================= 【新增】多账本：24 -> 25 迁移 =================
-+    static final Migration MIGRATION_24_25 = new Migration(24, 25) {
++    /**
++     * 安全加列：列已存在时跳过。
++     *
++     * <p>用于兼容“历史版本号被多账本补丁占用过”的旧数据库（那些库已有 bookId/tags 等列）。</p>
++     */
++    static void addColumnIfMissing(@NonNull SupportSQLiteDatabase database, String table,
++                                   String column, String definition) {
++        boolean exists = false;
++        android.database.Cursor cursor = null;
++        try {
++            cursor = database.query("PRAGMA table_info(" + table + ")");
++            int nameIndex = cursor.getColumnIndex("name");
++            while (cursor.moveToNext()) {
++                if (nameIndex >= 0 && column.equalsIgnoreCase(cursor.getString(nameIndex))) {
++                    exists = true;
++                    break;
++                }
++            }
++        } catch (Exception ignored) {
++            // 查询失败时按“不存在”处理，交给 ALTER 报错暴露问题
++        } finally {
++            if (cursor != null) {
++                cursor.close();
++            }
++        }
++        if (!exists) {
++            database.execSQL("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition);
++        }
++    }
++    // ================= 【新增】多账本：27 -> 28 迁移 =================
++    static final Migration MIGRATION_27_28 = new Migration(27, 28) {
 +        @Override
 +        public void migrate(@NonNull SupportSQLiteDatabase database) {
 +            // 1. 账本表
@@ -1112,13 +1241,18 @@ index 2e6c2c4..4fd38f8 100644
 +                    "`isCurrent` INTEGER NOT NULL DEFAULT 0)");
 +            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_books_name` ON `books` (`name`)");
 +
-+            // 2. 账单增加所属账本，历史数据统一归入默认账本(1)
-+            database.execSQL("ALTER TABLE transactions ADD COLUMN bookId INTEGER NOT NULL DEFAULT 0");
-+            database.execSQL("UPDATE transactions SET bookId = 1 WHERE bookId = 0");
++            // 2. 账单增加所属账本（旧库可能已有该列，用安全加列）
++            addColumnIfMissing(database, "transactions", "bookId", "INTEGER NOT NULL DEFAULT 0");
 +            database.execSQL("CREATE INDEX IF NOT EXISTS `index_transactions_bookId` ON `transactions` (`bookId`)");
 +
-+            // 3. 默认账本 + 触发器（未指定账本的新账单自动归入当前账本）
++            // 3. 默认账本 + 归属触发器（插入 / 更新两条）
 +            seedDefaultBook(database);
++
++            // 4. 【修复】把 bookId=0 的孤儿账单归入当前账本。
++            //    这类账单的资产变动已生效、界面却因账本过滤查不到（“编辑保存后账单消失”的根因）。
++            database.execSQL("UPDATE transactions SET bookId = " +
++                    "COALESCE((SELECT id FROM books WHERE isCurrent = 1 LIMIT 1), " + Book.DEFAULT_BOOK_ID + ") " +
++                    "WHERE bookId = 0 OR bookId IS NULL");
 +        }
 +    };
 +    // ==============================================================
@@ -1126,8 +1260,8 @@ index 2e6c2c4..4fd38f8 100644
 +    /**
 +     * 初始化默认账本与“自动归入当前账本”的触发器。
 +     *
-+     * <p>触发器让 Tally 原有的所有插入路径（手动记账、快捷磁贴、无障碍、利息服务等）
-+     * 无需修改即可正确归属账本。</p>
++     * <p>触发器让 Tally 原有的所有插入/更新路径（手动记账、快捷磁贴、无障碍、利息服务、
++     * 编辑保存等）无需修改即可正确归属账本。</p>
 +     */
 +    static void seedDefaultBook(@NonNull SupportSQLiteDatabase database) {
 +        database.execSQL("INSERT OR IGNORE INTO books (id, name, createdAt, sortOrder, isCurrent) " +
@@ -1138,15 +1272,22 @@ index 2e6c2c4..4fd38f8 100644
 +                "BEGIN UPDATE transactions SET bookId = " +
 +                "COALESCE((SELECT id FROM books WHERE isCurrent = 1 LIMIT 1), " + Book.DEFAULT_BOOK_ID + ") " +
 +                "WHERE id = NEW.id; END");
++        // 【修复】编辑保存（UPDATE）把 bookId 写成 0 时同样归入当前账本，
++        //        否则账单会因账本过滤从明细/记账页“消失”，而资产扣款仍然生效。
++        database.execSQL("CREATE TRIGGER IF NOT EXISTS trg_transactions_default_book_update " +
++                "AFTER UPDATE OF bookId ON transactions WHEN NEW.bookId = 0 " +
++                "BEGIN UPDATE transactions SET bookId = " +
++                "COALESCE((SELECT id FROM books WHERE isCurrent = 1 LIMIT 1), " + Book.DEFAULT_BOOK_ID + ") " +
++                "WHERE id = NEW.id; END");
 +    }
 +
-+    // ================= 【二期】25 -> 26 迁移：标签/币种代码/手续费 =================
-+    static final Migration MIGRATION_25_26 = new Migration(25, 26) {
++    // ================= 【二期】28 -> 29 迁移：标签/币种代码/手续费 =================
++    static final Migration MIGRATION_28_29 = new Migration(28, 29) {
 +        @Override
 +        public void migrate(@NonNull SupportSQLiteDatabase database) {
-+            database.execSQL("ALTER TABLE transactions ADD COLUMN tags TEXT DEFAULT ''");
-+            database.execSQL("ALTER TABLE transactions ADD COLUMN currencyCode TEXT DEFAULT 'CNY'");
-+            database.execSQL("ALTER TABLE transactions ADD COLUMN fee REAL NOT NULL DEFAULT 0.0");
++            addColumnIfMissing(database, "transactions", "tags", "TEXT DEFAULT ''");
++            addColumnIfMissing(database, "transactions", "currencyCode", "TEXT DEFAULT 'CNY'");
++            addColumnIfMissing(database, "transactions", "fee", "REAL NOT NULL DEFAULT 0.0");
 +        }
 +    };
 +    // ================================================================
@@ -1154,12 +1295,12 @@ index 2e6c2c4..4fd38f8 100644
      public static AppDatabase getDatabase(final Context context) {
          if (INSTANCE == null) {
              synchronized (AppDatabase.class) {
-@@ -199,8 +254,16 @@ public abstract class AppDatabase extends RoomDatabase {
-                                     MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
+@@ -245,8 +362,16 @@ public abstract class AppDatabase extends RoomDatabase {
                                      MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20,
                                      MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23,
--                                    MIGRATION_23_24
-+                                    MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26
+                                     MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
+-                                    MIGRATION_26_27
++                                    MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29
                              )
 +                            .addCallback(new RoomDatabase.Callback() {
 +                                @Override
@@ -1230,10 +1371,10 @@ index 0000000..f8b3630
 +}
 diff --git a/app/src/main/java/com/example/budgetapp/database/BookDao.java b/app/src/main/java/com/example/budgetapp/database/BookDao.java
 new file mode 100644
-index 0000000..5f011cb
+index 0000000..20aa8c9
 --- /dev/null
 +++ b/app/src/main/java/com/example/budgetapp/database/BookDao.java
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,82 @@
 +package com.example.budgetapp.database;
 +
 +import androidx.lifecycle.LiveData;
@@ -1298,6 +1439,17 @@ index 0000000..5f011cb
 +    void reassignTransactions(int fromBookId, int toBookId);
 +
 +    /**
++     * 把“未指定账本”（bookId = 0 或 NULL）的孤儿账单归入指定账本。
++     *
++     * <p>这类账单通常是旧版本编辑保存时丢了 bookId 造成的：资产变动已生效，
++     * 但界面按当前账本过滤后查不到。App 启动校正时调用，实现自愈。</p>
++     *
++     * @return 被修复的账单条数
++     */
++    @Query("UPDATE transactions SET bookId = :bookId WHERE bookId = 0 OR bookId IS NULL")
++    int assignUnassignedToBook(int bookId);
++
++    /**
 +     * 触碰一条账单记录，用于让 Room 的失效追踪器通知所有账单观察者刷新。
 +     *
 +     * <p>切换账本时调用：账单表本身没有写入，但 UI 需要按新的“当前账本”重新查询。</p>
@@ -1306,22 +1458,22 @@ index 0000000..5f011cb
 +    void touchTransactions();
 +}
 diff --git a/app/src/main/java/com/example/budgetapp/database/Transaction.java b/app/src/main/java/com/example/budgetapp/database/Transaction.java
-index c7d713e..83ba41d 100644
+index 587e721..b163d77 100644
 --- a/app/src/main/java/com/example/budgetapp/database/Transaction.java
 +++ b/app/src/main/java/com/example/budgetapp/database/Transaction.java
-@@ -10,7 +10,8 @@ import androidx.room.PrimaryKey;
-         indices = {
-                 @Index("date"),
-                 @Index("type"),
--                @Index("category")
-+                @Index("category"),
+@@ -13,7 +13,8 @@ import androidx.room.PrimaryKey;
+                 @Index("category"),
+                 @Index("isSettled"),
+                 @Index("recurringRuleId"),
+-                @Index("scheduledExecuteTime")
++                @Index("scheduledExecuteTime"),
 +                @Index("bookId")
          })
  public class Transaction {
      @PrimaryKey(autoGenerate = true)
-@@ -34,6 +35,27 @@ public class Transaction {
+@@ -49,6 +50,27 @@ public class Transaction {
      @androidx.room.ColumnInfo(defaultValue = "0")
-     public boolean excludeFromBudget;
+     public long scheduledExecuteTime = 0L;
  
 +    /**
 +     * 【新增】所属账本 ID（多账本功能）。
@@ -1348,7 +1500,7 @@ index c7d713e..83ba41d 100644
      }
  
 diff --git a/app/src/main/java/com/example/budgetapp/database/TransactionDao.java b/app/src/main/java/com/example/budgetapp/database/TransactionDao.java
-index 1450e24..74d3106 100644
+index c917e06..b31bd4b 100644
 --- a/app/src/main/java/com/example/budgetapp/database/TransactionDao.java
 +++ b/app/src/main/java/com/example/budgetapp/database/TransactionDao.java
 @@ -9,8 +9,21 @@ import androidx.room.Update;
@@ -1391,19 +1543,19 @@ index 1450e24..74d3106 100644
      @Query("SELECT * FROM transactions")
      List<Transaction> getAllTransactionsSync();
  
-@@ -33,37 +53,44 @@ public interface TransactionDao {
+@@ -33,38 +53,45 @@ public interface TransactionDao {
      void deleteAll();
  
      // 【新增】小组件使用：同步查询指定时间段加班总收入
--    @Query("SELECT SUM(amount) FROM transactions WHERE date >= :start AND date <= :end AND type = 1 AND category = '加班'")
+-    @Query("SELECT SUM(amount) FROM transactions WHERE date >= :start AND date <= :end AND type = 1 AND category = '加班' AND isSettled = 1")
 +    @Query("SELECT SUM(amount) FROM transactions WHERE" + CUR_BOOK
-+            + "AND date >= :start AND date <= :end AND type = 1 AND category = '加班'")
++            + "AND date >= :start AND date <= :end AND type = 1 AND category = '加班' AND isSettled = 1")
      Double getOvertimeTotalAmountSync(long start, long end);
  
      // 【新增】小组件使用：同步查询指定时间段所有加班记录（用于计算时长）
--    @Query("SELECT * FROM transactions WHERE date >= :start AND date <= :end AND type = 1 AND category = '加班'")
+-    @Query("SELECT * FROM transactions WHERE date >= :start AND date <= :end AND type = 1 AND category = '加班' AND isSettled = 1")
 +    @Query("SELECT * FROM transactions WHERE" + CUR_BOOK
-+            + "AND date >= :start AND date <= :end AND type = 1 AND category = '加班'")
++            + "AND date >= :start AND date <= :end AND type = 1 AND category = '加班' AND isSettled = 1")
      List<Transaction> getOvertimeTransactionsSync(long start, long end);
  
 +    /**
@@ -1440,47 +1592,48 @@ index 1450e24..74d3106 100644
      @Query("SELECT t.* FROM transactions t " +
              "LEFT JOIN asset_accounts a ON t.assetId = a.id " +
              "WHERE t.date BETWEEN :startDate AND :endDate " +
+             "AND t.isSettled = 1 " +
 +            "AND" + CUR_BOOK_T +
              "AND (:type IS NULL OR t.type = :type) " +
              "AND (:minAmount IS NULL OR t.amount >= :minAmount) " +
              "AND (:maxAmount IS NULL OR t.amount <= :maxAmount) " +
-@@ -73,20 +100,24 @@ public interface TransactionDao {
+@@ -74,20 +101,24 @@ public interface TransactionDao {
      LiveData<List<Transaction>> getFilteredTransactions(long startDate, long endDate, Integer type, Float minAmount, Float maxAmount, String keyword, String assetName);
  
      // 【新增】供桌面小组件使用：同步聚合查询指定时间的收入或支出总和
--    @Query("SELECT SUM(amount) FROM transactions WHERE date >= :start AND date <= :end AND type = :type AND category != '资产互转'")
+-    @Query("SELECT SUM(amount) FROM transactions WHERE date >= :start AND date <= :end AND type = :type AND category != '资产互转' AND isSettled = 1")
 +    @Query("SELECT SUM(amount) FROM transactions WHERE" + CUR_BOOK
-+            + "AND date >= :start AND date <= :end AND type = :type AND category != '资产互转'")
++            + "AND date >= :start AND date <= :end AND type = :type AND category != '资产互转' AND isSettled = 1")
      Double getTotalAmountByTypeSync(long start, long end, int type);
  
  
      // 3. 聚合查询：直接让数据库计算指定时间段的收入或支出总和 (返回 Double 防止没数据时报错)
--    @Query("SELECT SUM(amount) FROM transactions WHERE date >= :start AND date <= :end AND type = :type AND category != '资产互转'")
+-    @Query("SELECT SUM(amount) FROM transactions WHERE date >= :start AND date <= :end AND type = :type AND category != '资产互转' AND isSettled = 1")
 +    @Query("SELECT SUM(amount) FROM transactions WHERE" + CUR_BOOK
-+            + "AND date >= :start AND date <= :end AND type = :type AND category != '资产互转'")
++            + "AND date >= :start AND date <= :end AND type = :type AND category != '资产互转' AND isSettled = 1")
      LiveData<Double> getTotalAmountByTypeLive(long start, long end, int type);
  
      // 4. 聚合查询：直接计算加班总收入
--    @Query("SELECT SUM(amount) FROM transactions WHERE date >= :start AND date <= :end AND type = 1 AND category = '加班'")
+-    @Query("SELECT SUM(amount) FROM transactions WHERE date >= :start AND date <= :end AND type = 1 AND category = '加班' AND isSettled = 1")
 +    @Query("SELECT SUM(amount) FROM transactions WHERE" + CUR_BOOK
-+            + "AND date >= :start AND date <= :end AND type = 1 AND category = '加班'")
++            + "AND date >= :start AND date <= :end AND type = 1 AND category = '加班' AND isSettled = 1")
      LiveData<Double> getOvertimeTotalAmountLive(long start, long end);
  
      // 【新增】年视图专用的轻量级查询：只取3个字段，直接排除互转和转账，速度提升 10 倍以上
--    @Query("SELECT date, type, amount FROM transactions WHERE date >= :start AND date <= :end AND type IN (0, 1) AND category != '资产互转'")
+-    @Query("SELECT date, type, amount FROM transactions WHERE date >= :start AND date <= :end AND type IN (0, 1) AND category != '资产互转' AND isSettled = 1")
 +    @Query("SELECT date, type, amount FROM transactions WHERE" + CUR_BOOK
-+            + "AND date >= :start AND date <= :end AND type IN (0, 1) AND category != '资产互转'")
++            + "AND date >= :start AND date <= :end AND type IN (0, 1) AND category != '资产互转' AND isSettled = 1")
      List<TransactionMinimal> getMinimalTransactionsSync(long start, long end);
  
      /**
-@@ -96,7 +127,8 @@ public interface TransactionDao {
+@@ -97,7 +128,8 @@ public interface TransactionDao {
       */
      @Query("SELECT DISTINCT CAST(strftime('%m', date / 1000, 'unixepoch', 'localtime') AS INTEGER) " +
              "FROM transactions " +
 -            "WHERE date >= :start AND date <= :end " +
 +            "WHERE" + CUR_BOOK +
 +            "AND date >= :start AND date <= :end " +
-             "AND type IN (0, 1) AND category != '资产互转'")
+             "AND type IN (0, 1) AND category != '资产互转' AND isSettled = 1")
      List<Integer> getMonthsWithDataSync(long start, long end);
  
 diff --git a/app/src/main/java/com/example/budgetapp/ui/BookDialogs.java b/app/src/main/java/com/example/budgetapp/ui/BookDialogs.java
@@ -1677,10 +1830,10 @@ index 0000000..8e9270d
 +    }
 +}
 diff --git a/app/src/main/java/com/example/budgetapp/ui/DetailsAdapter.java b/app/src/main/java/com/example/budgetapp/ui/DetailsAdapter.java
-index 5cc5ef5..40f62de 100644
+index 35e9793..3832c4f 100644
 --- a/app/src/main/java/com/example/budgetapp/ui/DetailsAdapter.java
 +++ b/app/src/main/java/com/example/budgetapp/ui/DetailsAdapter.java
-@@ -163,9 +163,31 @@ public class DetailsAdapter extends RecyclerView.Adapter<DetailsAdapter.ViewHold
+@@ -220,9 +220,31 @@ public class DetailsAdapter extends RecyclerView.Adapter<DetailsAdapter.ViewHold
              holder.tvSubCategory.setVisibility(View.GONE);
          }
  
@@ -1777,10 +1930,10 @@ index 3615d61..f3bcbf7 100644
          if (transactions == null || getContext() == null) return;
  
 diff --git a/app/src/main/java/com/example/budgetapp/ui/SettingsActivity.java b/app/src/main/java/com/example/budgetapp/ui/SettingsActivity.java
-index 08af571..0ad4c01 100644
+index 841ece1..fd1458f 100644
 --- a/app/src/main/java/com/example/budgetapp/ui/SettingsActivity.java
 +++ b/app/src/main/java/com/example/budgetapp/ui/SettingsActivity.java
-@@ -444,7 +444,8 @@ public class SettingsActivity extends AppCompatActivity {
+@@ -463,7 +463,8 @@ public class SettingsActivity extends AppCompatActivity {
          });
  
          financeViewModel = new ViewModelProvider(this).get(FinanceViewModel.class);
@@ -1791,7 +1944,7 @@ index 08af571..0ad4c01 100644
  
          findViewById(R.id.btn_category_setting).setOnClickListener(v -> startActivity(new Intent(this, CategorySettingsActivity.class)));
 diff --git a/app/src/main/java/com/example/budgetapp/ui/TransactionListAdapter.java b/app/src/main/java/com/example/budgetapp/ui/TransactionListAdapter.java
-index a0f4250..66e31e6 100644
+index 81d26ae..5821777 100644
 --- a/app/src/main/java/com/example/budgetapp/ui/TransactionListAdapter.java
 +++ b/app/src/main/java/com/example/budgetapp/ui/TransactionListAdapter.java
 @@ -18,6 +18,7 @@ import java.time.LocalDate;
@@ -1802,7 +1955,7 @@ index a0f4250..66e31e6 100644
  import java.util.Map;
  
  public class TransactionListAdapter extends RecyclerView.Adapter<TransactionListAdapter.ViewHolder> {
-@@ -119,10 +120,31 @@ public class TransactionListAdapter extends RecyclerView.Adapter<TransactionList
+@@ -148,10 +149,31 @@ public class TransactionListAdapter extends RecyclerView.Adapter<TransactionList
              holder.tvSubCategory.setVisibility(View.GONE);
          }
  
@@ -1838,10 +1991,10 @@ index a0f4250..66e31e6 100644
          }
 diff --git a/app/src/main/java/com/example/budgetapp/util/BookManager.java b/app/src/main/java/com/example/budgetapp/util/BookManager.java
 new file mode 100644
-index 0000000..b9780c3
+index 0000000..2a31e57
 --- /dev/null
 +++ b/app/src/main/java/com/example/budgetapp/util/BookManager.java
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,482 @@
 +package com.example.budgetapp.util;
 +
 +import android.content.Context;
@@ -2171,6 +2324,75 @@ index 0000000..b9780c3
 +        }
 +    }
 +
++    /**
++     * 恢复备份中的账本表（<b>仅限后台线程</b>）。
++     *
++     * <p>两个作用：</p>
++     * <ol>
++     *   <li>把备份里的账本（含“当前账本”标记）恢复到数据库；</li>
++     *   <li>若备份里没有账本信息（旧备份没有 books 字段），为账单引用到的每个 bookId 补建账本——
++     *       否则这些账单会被“当前账本”过滤掉，表现为恢复备份后账单大量消失。</li>
++     * </ol>
++     */
++    public static void restoreBooksSync(Context context, List<Book> backupBooks, List<Integer> referencedBookIds) {
++        try {
++            AppDatabase db = AppDatabase.getDatabase(context);
++            int currentId = -1;
++
++            if (backupBooks != null) {
++                for (Book b : backupBooks) {
++                    if (b == null || TextUtils.isEmpty(b.name)) {
++                        continue;
++                    }
++                    Book existing = (b.id > 0) ? db.bookDao().getByIdSync(b.id) : null;
++                    if (existing == null) {
++                        existing = db.bookDao().getByNameSync(b.name.trim());
++                    }
++                    if (existing == null) {
++                        Book nb = new Book(b.name.trim(), b.sortOrder);
++                        if (b.id > 0) {
++                            nb.id = b.id;
++                        }
++                        nb.createdAt = b.createdAt > 0 ? b.createdAt : System.currentTimeMillis();
++                        nb.isCurrent = false;
++                        long newId = db.bookDao().insert(nb);
++                        existing = db.bookDao().getByIdSync(b.id > 0 ? b.id : (int) newId);
++                    }
++                    if (existing != null && b.isCurrent) {
++                        currentId = existing.id;
++                    }
++                }
++            }
++
++            if (referencedBookIds != null) {
++                for (Integer id : referencedBookIds) {
++                    if (id == null || id <= 0) {
++                        continue;
++                    }
++                    if (db.bookDao().getByIdSync(id) == null) {
++                        Book orphan = new Book("账本 " + id, db.bookDao().countSync());
++                        orphan.id = id;
++                        db.bookDao().insert(orphan);
++                    }
++                }
++            }
++
++            if (currentId > 0) {
++                Book cur = db.bookDao().getByIdSync(currentId);
++                db.bookDao().clearCurrent();
++                db.bookDao().markCurrent(currentId);
++                if (cur != null) {
++                    prefs(context).edit()
++                            .putInt(KEY_CURRENT_ID, cur.id)
++                            .putString(KEY_CURRENT_NAME, cur.name)
++                            .apply();
++                }
++            }
++        } catch (Exception ignored) {
++            // 恢复账本失败不影响其它数据导入
++        }
++    }
++
 +    // ================= 内部 =================
 +
 +    /**
@@ -2228,6 +2450,15 @@ index 0000000..b9780c3
 +                    }
 +                }
 +            }
++
++            // 【修复】把 bookId = 0 的“孤儿账单”归入当前账本。
++            // 旧版本在明细页编辑保存时会新建 Transaction 而不带 bookId，@Update 把 bookId 写成 0，
++            // 结果账单被“当前账本”过滤掉：资产扣款还在，明细/记账页却查不到。
++            // 这里在启动时把它们领回来，等于自动修复历史坏数据。
++            Book currentForRepair = db.bookDao().getCurrentSync();
++            if (currentForRepair != null) {
++                db.bookDao().assignUnassignedToBook(currentForRepair.id);
++            }
 +        } catch (Exception ignored) {
 +            // 校正失败不影响正常使用
 +        }
@@ -2247,7 +2478,7 @@ index 0000000..b9780c3
 +    }
 +}
 diff --git a/app/src/main/java/com/example/budgetapp/viewmodel/FinanceViewModel.java b/app/src/main/java/com/example/budgetapp/viewmodel/FinanceViewModel.java
-index 3a7dd8b..8352062 100644
+index 3a7dd8b..45c6344 100644
 --- a/app/src/main/java/com/example/budgetapp/viewmodel/FinanceViewModel.java
 +++ b/app/src/main/java/com/example/budgetapp/viewmodel/FinanceViewModel.java
 @@ -36,6 +36,8 @@ public class FinanceViewModel extends AndroidViewModel {
@@ -2280,6 +2511,37 @@ index 3a7dd8b..8352062 100644
      public void addTransaction(Transaction transaction) {
          AppDatabase.databaseWriteExecutor.execute(() -> {
              transactionDao.insert(transaction);
+@@ -260,7 +269,29 @@ public class FinanceViewModel extends AndroidViewModel {
+                     }
+                 }
+ 
+-                // 3. 最终更新数据库中的账单记录
++                // 3. 【修复】保留界面未提供的字段。
++                //    明细/记账/统计页编辑保存时会新建一个 Transaction，只回填了部分字段；
++                //    若直接 @Update，bookId 会被写成默认值 0，账单随即被“当前账本”过滤掉
++                //    （表现为：编辑保存后账单从明细/记账页消失，但资产扣款仍在）。
++                if (newTx.bookId == 0) {
++                    newTx.bookId = (oldTx.bookId != 0)
++                            ? oldTx.bookId
++                            : com.example.budgetapp.util.BookManager.getCurrentBookId(getApplication());
++                }
++                if (android.text.TextUtils.isEmpty(newTx.tags)) {
++                    newTx.tags = oldTx.tags;
++                }
++                if (android.text.TextUtils.isEmpty(newTx.currencyCode)) {
++                    newTx.currencyCode = oldTx.currencyCode;
++                }
++                if (android.text.TextUtils.isEmpty(newTx.currencySymbol)) {
++                    newTx.currencySymbol = oldTx.currencySymbol;
++                }
++                if (newTx.fee == 0) {
++                    newTx.fee = oldTx.fee;
++                }
++
++                // 4. 最终更新数据库中的账单记录
+                 transactionDao.update(newTx);
+             });
+             com.example.budgetapp.BackupManager.triggerAutoUploadIfEnabled(getApplication());
 diff --git a/app/src/main/res/drawable/bg_book_chip.xml b/app/src/main/res/drawable/bg_book_chip.xml
 new file mode 100644
 index 0000000..3718649
@@ -2327,3 +2589,20 @@ index 0b4f43b..9b9c2e4 100644
      <LinearLayout
          android:id="@+id/layout_week_header"
          android:layout_width="match_parent"
+diff --git a/app/src/main/res/values/themes.xml b/app/src/main/res/values/themes.xml
+index e3b4857..4345bda 100644
+--- a/app/src/main/res/values/themes.xml
++++ b/app/src/main/res/values/themes.xml
+@@ -57,7 +57,10 @@
+         <item name="android:windowContentOverlay">@null</item>
+         <item name="android:windowNoTitle">true</item>
+         <item name="android:windowIsFloating">true</item>
+-        <item name="android:backgroundDimEnabled">true</item>
++        <item name="android:backgroundDimEnabled">false</item>
+     </style>
+ 
++    <!-- 外部记账接口专用：完全无窗口，不抢焦点，不闪屏 -->
++    <style name="Theme.BudgetApp.NoDisplay" parent="@android:style/Theme.NoDisplay" />
++
+ </resources>
+\ No newline at end of file
