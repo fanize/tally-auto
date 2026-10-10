@@ -1,4 +1,4 @@
-﻿name: Auto Build Tally
+name: Auto Build Tally
 on:
   schedule: [{cron: "0 2 * * *"}]
   workflow_dispatch:
@@ -8,43 +8,82 @@ jobs:
     permissions: {issues: write, contents: write}
     steps:
       - uses: actions/checkout@v4
-      - run: git clone --depth 1 https://github.com/cypressincloud/Tally.git upstream
+
+      - name: Clone upstream Tally
+        run: git clone --depth 1 https://github.com/cypressincloud/Tally.git upstream
+
       - id: up
-        run: cd upstream && echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-      - id: patch
-        run: cd upstream && (git apply ../patches/tally-auto.patch && echo "ok=true" >> $GITHUB_OUTPUT) || (echo "ok=false" >> $GITHUB_OUTPUT && echo "Patch failed")
-      - if: steps.patch.outputs.ok == 'true'
-        name: Fix Maven mirrors for GitHub Actions
+        name: Read upstream version
         run: |
           cd upstream
-          sed -i 's|maven { url = uri("https://maven.aliyun.com/repository/public") }|google()\n        mavenCentral()|g' settings.gradle.kts
-          sed -i 's|maven { url = uri("https://maven.aliyun.com/repository/google") }||g' settings.gradle.kts
-          sed -i 's|maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }|gradlePluginPortal()|g' settings.gradle.kts
+          echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "version=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)" >> $GITHUB_OUTPUT
+
+      - id: patch
+        name: Apply our feature patch
+        run: |
+          cd upstream
+          if git apply ../patches/tally-auto.patch; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "ok=false" >> $GITHUB_OUTPUT
+            echo "::error::补丁无法应用：上游改动与我们的补丁冲突，需要重新生成 patches/tally-auto.patch"
+            exit 1
+          fi
+
+      - name: Use official Maven repos
+        if: steps.patch.outputs.ok == 'true'
+        run: |
+          cd upstream
+          # 上游用阿里云镜像；GitHub 服务器（美国）访问会 502。官方源在国内也能访问。
+          sed -i '/maven.aliyun.com/d' settings.gradle.kts
+          grep -n 'google()' settings.gradle.kts | head -3
+
       - if: steps.patch.outputs.ok == 'true'
         uses: actions/setup-java@v4
         with: {java-version: "17", distribution: "microsoft"}
+
       - if: steps.patch.outputs.ok == 'true'
+        name: Build release APK
         run: cd upstream && chmod +x gradlew && ./gradlew :app:assembleRelease --no-daemon
+
       - if: steps.patch.outputs.ok == 'true'
-        name: Sign APK
+        name: Sign APK (与手机已装版本同一签名，可直接覆盖安装)
         run: |
           cd upstream
           echo "$KEYSTORE_BASE64" | base64 -d > /tmp/ks.jks
           BT=$(ls -d $ANDROID_HOME/build-tools/* | tail -1)
           "$BT/zipalign" -p -f 4 app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
-          "$BT/apksigner" sign --ks /tmp/ks.jks --ks-key-alias "$KEY_ALIAS" --ks-pass pass:"$KEYSTORE_PASS" --key-pass pass:"$KEY_PASS" --out "Tally-auto.apk" aligned.apk
+          "$BT/apksigner" sign --ks /tmp/ks.jks --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass pass:"$KEYSTORE_PASS" --key-pass pass:"$KEY_PASS" \
+            --out "Tally-${{ steps.up.outputs.version }}-auto.apk" aligned.apk
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASS: ${{ secrets.KEY_PASS }}
+
       - if: steps.patch.outputs.ok == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "tally-${{ steps.up.outputs.sha }}"
-          files: upstream/Tally-auto.apk
-      - if: steps.patch.outputs.ok == 'false'
+          tag_name: "tally-${{ steps.up.outputs.version }}-${{ steps.up.outputs.sha }}"
+          name: "Tally ${{ steps.up.outputs.version }} + 自动记账（${{ steps.up.outputs.sha }}）"
+          files: upstream/Tally-*-auto.apk
+          body: |
+            Tally ${{ steps.up.outputs.version }} 官方源码 + 我们的自动记账接口补丁。
+            上游 commit：${{ steps.up.outputs.sha }}
+
+            手机下载 **Tally-${{ steps.up.outputs.version }}-auto.apk** 直接覆盖安装即可（签名与已装版本一致）。
+
+      - name: Patch conflict -> open an issue
+        if: failure()
         continue-on-error: true
         uses: actions/github-script@v7
         with:
-          script: github.rest.issues.create({owner:context.repo.owner,repo:context.repo.repo,title:"Patch failed on ${{ steps.up.outputs.sha }}",body:"Update patches/tally-auto.patch"})
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "⚠️ 补丁应用失败：上游已更新，需要重新生成补丁",
+              body: "上游 Tally 有改动，`patches/tally-auto.patch` 无法应用，本次没有产出 APK。\n\n请把这条通知转告 agent，让它重新生成补丁。\n\n运行记录：" + context.serverUrl + "/" + context.repo.owner + "/" + context.repo.repo + "/actions/runs/" + context.runId
+            })
